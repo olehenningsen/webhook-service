@@ -107,13 +107,18 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    // Fire-and-forget: dispatch available work to idle developers
-    dispatchAvailableWork().catch((error) => {
+    // Await orchestrator — must complete before Vercel kills the runtime
+    try {
+      const result = await dispatchAvailableWork();
+      console.log(
+        `[webhook] Orchestrator: assigned=${result.assigned}, skipped=${result.skipped}`
+      );
+    } catch (error) {
       console.error(
         `[webhook] Orchestrator dispatch failed for ${payload.data.identifier}:`,
         error
       );
-    });
+    }
 
     return NextResponse.json({ received: true, eventId: event.id });
   }
@@ -181,12 +186,14 @@ export async function POST(request: NextRequest) {
 
   // 13. If issue moved to Done, re-evaluate orchestrator (blocker may have resolved)
   if (toStatus === "Done") {
-    dispatchAvailableWork().catch((error) => {
+    try {
+      await dispatchAvailableWork();
+    } catch (error) {
       console.error(
         `[webhook] Orchestrator re-evaluation failed after Done:`,
         error
       );
-    });
+    }
   }
 
   return NextResponse.json({ received: true, eventId: event.id });
