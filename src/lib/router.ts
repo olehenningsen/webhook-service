@@ -1,12 +1,14 @@
 /**
- * Maps Linear issue statuses to the agent that should be triggered.
- * Returns null if no agent should be triggered (informational or manual step).
+ * Maps Linear issue statuses to the agent and/or git action that should be triggered.
  */
+
+import type { GitAction } from "./git-workflow";
 
 export interface RouteResult {
   agent: string | null;
-  action: "trigger" | "log" | "notify";
+  action: "trigger" | "log" | "notify" | "git";
   description: string;
+  gitAction?: GitAction;
 }
 
 const STATUS_AGENT_MAP: Record<string, RouteResult> = {
@@ -28,13 +30,15 @@ const STATUS_AGENT_MAP: Record<string, RouteResult> = {
   },
   "In Progress": {
     agent: null,
-    action: "log",
-    description: "Developer arbejder — kun log",
+    action: "git",
+    gitAction: "create-branch",
+    description: "Opret feature branch fra main",
   },
   Test: {
     agent: "scout",
     action: "trigger",
-    description: "Scout (Tester) starter testplan og test-eksekvering",
+    gitAction: "create-pr",
+    description: "Opret PR + Scout (Tester) starter testplan og test-eksekvering",
   },
   Review: {
     agent: null,
@@ -43,8 +47,9 @@ const STATUS_AGENT_MAP: Record<string, RouteResult> = {
   },
   Done: {
     agent: null,
-    action: "trigger",
-    description: "Trigger auto-merge (TEA-9)",
+    action: "git",
+    gitAction: "auto-merge",
+    description: "Auto-merge PR (squash) og slet branch",
   },
   Backlog: {
     agent: null,

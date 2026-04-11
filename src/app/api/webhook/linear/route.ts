@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { routeStatus } from "@/lib/router";
 import { isAgentRunning, enqueue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
+import { executeGitAction } from "@/lib/git-workflow";
 import {
   LinearWebhookPayloadSchema,
   isStatusChange,
@@ -79,7 +80,7 @@ export async function POST(request: NextRequest) {
     },
   });
 
-  // 7. Route status to agent
+  // 7. Route status to agent/git action
   const route = routeStatus(toStatus);
 
   if (route.action === "log") {
@@ -95,7 +96,7 @@ export async function POST(request: NextRequest) {
   }
 
   // 8. Check queue — is an agent already running on this issue?
-  if (await isAgentRunning(payload.data.identifier)) {
+  if (route.agent && (await isAgentRunning(payload.data.identifier))) {
     await enqueue(event.id, payload.data.identifier);
     return NextResponse.json({
       received: true,
@@ -104,9 +105,26 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // 9. Trigger agent (if there is one to trigger)
+  // 9. Execute git action if configured (fire and forget)
+  if (route.gitAction) {
+    executeGitAction({
+      eventId: event.id,
+      action: route.gitAction,
+      issueKey: payload.data.identifier,
+      issueTitle: payload.data.title,
+      issueDescription: payload.data.description,
+      teamKey: payload.data.team?.key,
+      labels: payload.data.labels?.map((l) => l.name),
+    }).catch((error) => {
+      console.error(
+        `[webhook] Git action '${route.gitAction}' failed for ${payload.data.identifier}:`,
+        error
+      );
+    });
+  }
+
+  // 10. Trigger agent if configured (fire and forget)
   if (route.agent) {
-    // Fire and forget — don't block the webhook response
     triggerAgent({
       eventId: event.id,
       agent: route.agent,
@@ -120,9 +138,13 @@ export async function POST(request: NextRequest) {
         error
       );
     });
-  } else {
-    // No specific agent (e.g., Todo → developer orchestration, Done → auto-merge)
-    // Mark as completed for now — TEA-11 and TEA-9 will add handling
+  }
+
+  // 11. For git-only actions (no agent), the event is managed by executeGitAction
+  // For agent-only actions, managed by triggerAgent
+  // For both (e.g., Test = create-pr + scout), both run in parallel
+  if (!route.agent && !route.gitAction) {
+    // No specific handler (e.g., notify) — mark as completed
     await prisma.webhookEvent.update({
       where: { id: event.id },
       data: {

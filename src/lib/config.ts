@@ -8,6 +8,14 @@ const envSchema = z.object({
   VERCEL_URL: z.string().optional(),
   CRON_SECRET: z.string().optional(),
 
+  // GitHub (TEA-9: Git workflow engine)
+  GITHUB_TOKEN: z.string().optional(),
+  GITHUB_OWNER: z.string().optional(),
+  GITHUB_DEFAULT_REPO: z.string().optional(),
+
+  // Linear API (for write-back: comments, status changes)
+  LINEAR_API_KEY: z.string().optional(),
+
   // Managed agent IDs
   AGENT_ID_SAGA: z.string().optional(),
   AGENT_ID_ATLAS: z.string().optional(),
@@ -89,4 +97,41 @@ export function getAgentConfig(agentName: string): {
   }
 
   return { agentId, environmentId };
+}
+
+/**
+ * Get GitHub configuration for git workflow operations.
+ */
+export function getGitHubConfig(): {
+  token: string;
+  owner: string;
+  defaultRepo: string;
+} {
+  const env = getEnv();
+
+  if (!env.GITHUB_TOKEN) {
+    throw new Error("GITHUB_TOKEN env var not configured.");
+  }
+  if (!env.GITHUB_OWNER) {
+    throw new Error("GITHUB_OWNER env var not configured.");
+  }
+  if (!env.GITHUB_DEFAULT_REPO) {
+    throw new Error("GITHUB_DEFAULT_REPO env var not configured.");
+  }
+
+  return {
+    token: env.GITHUB_TOKEN,
+    owner: env.GITHUB_OWNER,
+    defaultRepo: env.GITHUB_DEFAULT_REPO,
+  };
+}
+
+/**
+ * Resolve the GitHub repo for a Linear team key.
+ * Currently all TEA issues map to the default repo.
+ */
+export function getRepoForTeam(teamKey?: string): string {
+  const { defaultRepo } = getGitHubConfig();
+  // Expand this map when multiple repos are needed
+  return defaultRepo;
 }
