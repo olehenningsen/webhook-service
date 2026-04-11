@@ -1,0 +1,39 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum WebhookEventStatus {
+  RECEIVED    // Modtaget, venter på processering
+  QUEUED      // I kø — agent kører allerede på dette issue
+  PROCESSING  // Agent er trigget, afventer svar
+  COMPLETED   // Agent færdig
+  FAILED      // Alle retries opbrugt
+  SKIPPED     // Duplikat eller irrelevant event
+}
+
+model WebhookEvent {
+  id              String             @id @default(cuid())
+  linearEventId   String             @unique
+  issueId         String
+  issueTitle      String
+  fromStatus      String?
+  toStatus        String
+  triggeredAgent  String?
+  agentSessionId  String?
+  status          WebhookEventStatus @default(RECEIVED)
+  errorMessage    String?
+  retryCount      Int                @default(0)
+  queuePosition   Int?
+  processedAt     DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  @@index([issueId, createdAt])
+  @@index([status])
+  @@index([createdAt])
+}
