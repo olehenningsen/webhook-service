@@ -6,6 +6,7 @@ import { routeStatus } from "@/lib/router";
 import { isAgentRunning, enqueue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
 import { executeGitAction } from "@/lib/git-workflow";
+import { dispatchAvailableWork } from "@/lib/orchestrator";
 import {
   LinearWebhookPayloadSchema,
   isStatusChange,
@@ -95,7 +96,29 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ received: true, eventId: event.id });
   }
 
-  // 8. Check queue — is an agent already running on this issue?
+  // 8. Handle orchestrate action (TEA-11: developer parallelization)
+  if (route.action === "orchestrate") {
+    // Mark event completed (orchestrator manages its own events)
+    await prisma.webhookEvent.update({
+      where: { id: event.id },
+      data: {
+        status: WebhookEventStatus.COMPLETED,
+        processedAt: new Date(),
+      },
+    });
+
+    // Fire-and-forget: dispatch available work to idle developers
+    dispatchAvailableWork().catch((error) => {
+      console.error(
+        `[webhook] Orchestrator dispatch failed for ${payload.data.identifier}:`,
+        error
+      );
+    });
+
+    return NextResponse.json({ received: true, eventId: event.id });
+  }
+
+  // 9. Check queue — is an agent already running on this issue?
   if (route.agent && (await isAgentRunning(payload.data.identifier))) {
     await enqueue(event.id, payload.data.identifier);
     return NextResponse.json({
@@ -105,7 +128,7 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // 9. Execute git action if configured (await — fast enough for Vercel timeout)
+  // 10. Execute git action if configured (await — fast enough for Vercel timeout)
   if (route.gitAction) {
     try {
       await executeGitAction({
@@ -125,7 +148,7 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // 10. Trigger agent if configured (fire and forget)
+  // 11. Trigger agent if configured (fire and forget)
   if (route.agent) {
     triggerAgent({
       eventId: event.id,
@@ -142,7 +165,7 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // 11. For git-only actions (no agent), the event is managed by executeGitAction
+  // 12. For git-only actions (no agent), the event is managed by executeGitAction
   // For agent-only actions, managed by triggerAgent
   // For both (e.g., Test = create-pr + scout), both run in parallel
   if (!route.agent && !route.gitAction) {
@@ -153,6 +176,16 @@ export async function POST(request: NextRequest) {
         status: WebhookEventStatus.COMPLETED,
         processedAt: new Date(),
       },
+    });
+  }
+
+  // 13. If issue moved to Done, re-evaluate orchestrator (blocker may have resolved)
+  if (toStatus === "Done") {
+    dispatchAvailableWork().catch((error) => {
+      console.error(
+        `[webhook] Orchestrator re-evaluation failed after Done:`,
+        error
+      );
     });
   }
 

@@ -1,5 +1,22 @@
 import { z } from "zod";
 
+// ─── Developer Pool & Orchestrator Config (TEA-11) ──────────
+
+export const DEVELOPER_POOL = ["pixel", "sprite", "byte", "loop"] as const;
+export type DeveloperAgent = (typeof DEVELOPER_POOL)[number];
+
+export const ORCHESTRATOR_CONFIG = {
+  teamKey: "TEA",
+  maxDeveloperTimeMs: 30 * 60 * 1000, // 30 minutes before escalation
+  labelPrefix: "dev:",
+  labelColors: {
+    pixel: "#FF6B6B",
+    sprite: "#4ECDC4",
+    byte: "#45B7D1",
+    loop: "#96CEB4",
+  } as Record<DeveloperAgent, string>,
+};
+
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   LINEAR_WEBHOOK_SECRET: z.string().min(1),

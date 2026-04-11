@@ -6,7 +6,7 @@ import type { GitAction } from "./git-workflow";
 
 export interface RouteResult {
   agent: string | null;
-  action: "trigger" | "log" | "notify" | "git";
+  action: "trigger" | "log" | "notify" | "git" | "orchestrate";
   description: string;
   gitAction?: GitAction;
 }
@@ -24,9 +24,9 @@ const STATUS_AGENT_MAP: Record<string, RouteResult> = {
   },
   Todo: {
     agent: null,
-    action: "trigger",
+    action: "orchestrate",
     description:
-      "Developer-orkestrering — tildel til ledig developer (TEA-11)",
+      "Developer-orkestrering — tildel til ledig developer",
   },
   "In Progress": {
     agent: null,

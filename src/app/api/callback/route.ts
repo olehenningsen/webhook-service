@@ -6,6 +6,8 @@ import { dequeue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
 import { executeGitAction } from "@/lib/git-workflow";
 import { routeStatus } from "@/lib/router";
+import { dispatchAvailableWork } from "@/lib/orchestrator";
+import { DEVELOPER_POOL } from "@/lib/config";
 
 const CallbackSchema = z.object({
   eventId: z.string(),
@@ -93,6 +95,13 @@ export async function POST(request: NextRequest) {
         );
       });
     }
+  }
+
+  // If a developer agent completed, re-evaluate orchestrator for new work
+  if (DEVELOPER_POOL.includes(event.triggeredAgent as typeof DEVELOPER_POOL[number])) {
+    dispatchAvailableWork().catch((error) => {
+      console.error(`[callback] Orchestrator dispatch failed:`, error);
+    });
   }
 
   return NextResponse.json({ received: true });

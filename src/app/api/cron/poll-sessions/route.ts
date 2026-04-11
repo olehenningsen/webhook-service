@@ -6,6 +6,8 @@ import { dequeue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
 import { executeGitAction } from "@/lib/git-workflow";
 import { routeStatus } from "@/lib/router";
+import { dispatchAvailableWork } from "@/lib/orchestrator";
+import { DEVELOPER_POOL } from "@/lib/config";
 
 const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
@@ -66,6 +68,13 @@ export async function GET(request: NextRequest) {
 
         // Dequeue next event for this issue
         await dequeueNext(event.issueId);
+
+        // If a developer agent timed out, free the slot and re-evaluate
+        if (DEVELOPER_POOL.includes(event.triggeredAgent as typeof DEVELOPER_POOL[number])) {
+          dispatchAvailableWork().catch((error) => {
+            console.error(`[poll-sessions] Orchestrator dispatch failed:`, error);
+          });
+        }
         continue;
       }
 
@@ -91,6 +100,13 @@ export async function GET(request: NextRequest) {
 
         // Dequeue next event for this issue
         await dequeueNext(event.issueId);
+
+        // If a developer agent completed, re-evaluate orchestrator
+        if (DEVELOPER_POOL.includes(event.triggeredAgent as typeof DEVELOPER_POOL[number])) {
+          dispatchAvailableWork().catch((error) => {
+            console.error(`[poll-sessions] Orchestrator dispatch failed:`, error);
+          });
+        }
       } else if (session.status === "terminated") {
         // Agent failed permanently
         await prisma.webhookEvent.update({
@@ -111,6 +127,13 @@ export async function GET(request: NextRequest) {
 
         // Dequeue next event for this issue
         await dequeueNext(event.issueId);
+
+        // If a developer agent failed, free the slot and re-evaluate
+        if (DEVELOPER_POOL.includes(event.triggeredAgent as typeof DEVELOPER_POOL[number])) {
+          dispatchAvailableWork().catch((error) => {
+            console.error(`[poll-sessions] Orchestrator dispatch failed:`, error);
+          });
+        }
       } else {
         // Still running or rescheduling — check again next cycle
         results.push({
