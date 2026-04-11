@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
 import { dequeue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
+import { executeGitAction } from "@/lib/git-workflow";
 import { routeStatus } from "@/lib/router";
 
 const CallbackSchema = z.object({
@@ -59,6 +60,25 @@ export async function POST(request: NextRequest) {
   const next = await dequeue(event.issueId);
   if (next) {
     const route = routeStatus(next.toStatus);
+
+    // Execute git action if configured
+    if (route.gitAction) {
+      try {
+        await executeGitAction({
+          eventId: next.id,
+          action: route.gitAction,
+          issueKey: next.issueId,
+          issueTitle: next.issueTitle,
+        });
+      } catch (error) {
+        console.error(
+          `[callback] Git action '${route.gitAction}' failed for ${next.issueId}:`,
+          error
+        );
+      }
+    }
+
+    // Trigger agent if configured
     if (route.agent) {
       triggerAgent({
         eventId: next.id,

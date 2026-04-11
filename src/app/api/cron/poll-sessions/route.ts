@@ -4,6 +4,7 @@ import { WebhookEventStatus } from "@/generated/prisma/enums";
 import { getSessionStatus } from "@/lib/managed-agents";
 import { dequeue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
+import { executeGitAction } from "@/lib/git-workflow";
 import { routeStatus } from "@/lib/router";
 
 const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
@@ -147,24 +148,44 @@ export async function GET(request: NextRequest) {
 
 /**
  * Dequeue and trigger the next event for an issue.
+ * Handles both git actions and agent triggers.
  */
 async function dequeueNext(issueId: string): Promise<void> {
   const next = await dequeue(issueId);
-  if (next) {
-    const route = routeStatus(next.toStatus);
-    if (route.agent) {
-      triggerAgent({
+  if (!next) return;
+
+  const route = routeStatus(next.toStatus);
+
+  // Execute git action if configured
+  if (route.gitAction) {
+    try {
+      await executeGitAction({
         eventId: next.id,
-        agent: route.agent,
-        issueId: next.issueId,
+        action: route.gitAction,
+        issueKey: next.issueId,
         issueTitle: next.issueTitle,
-        toStatus: next.toStatus,
-      }).catch((error) => {
-        console.error(
-          `[poll-sessions] Failed to trigger next queued agent for ${next.issueId}:`,
-          error
-        );
       });
+    } catch (error) {
+      console.error(
+        `[poll-sessions] Git action '${route.gitAction}' failed for ${next.issueId}:`,
+        error
+      );
     }
+  }
+
+  // Trigger agent if configured
+  if (route.agent) {
+    triggerAgent({
+      eventId: next.id,
+      agent: route.agent,
+      issueId: next.issueId,
+      issueTitle: next.issueTitle,
+      toStatus: next.toStatus,
+    }).catch((error) => {
+      console.error(
+        `[poll-sessions] Failed to trigger next queued agent for ${next.issueId}:`,
+        error
+      );
+    });
   }
 }
