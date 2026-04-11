@@ -66,6 +66,12 @@ export async function executeGitAction(
             issueKey: input.issueKey,
             issueTitle: input.issueTitle,
           });
+
+          if (result.noCommits) {
+            resultMessage = `No commits on branch '${result.branchName}' — PR skipped (branch exists, awaiting agent commits)`;
+            break;
+          }
+
           resultMessage = `PR created: #${result.prNumber} ${result.prUrl}`;
 
           // Hotfix fast-track: merge immediately if labeled
