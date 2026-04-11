@@ -105,22 +105,24 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // 9. Execute git action if configured (fire and forget)
+  // 9. Execute git action if configured (await — fast enough for Vercel timeout)
   if (route.gitAction) {
-    executeGitAction({
-      eventId: event.id,
-      action: route.gitAction,
-      issueKey: payload.data.identifier,
-      issueTitle: payload.data.title,
-      issueDescription: payload.data.description,
-      teamKey: payload.data.team?.key,
-      labels: payload.data.labels?.map((l) => l.name),
-    }).catch((error) => {
+    try {
+      await executeGitAction({
+        eventId: event.id,
+        action: route.gitAction,
+        issueKey: payload.data.identifier,
+        issueTitle: payload.data.title,
+        issueDescription: payload.data.description,
+        teamKey: payload.data.team?.key,
+        labels: payload.data.labels?.map((l) => l.name),
+      });
+    } catch (error) {
       console.error(
         `[webhook] Git action '${route.gitAction}' failed for ${payload.data.identifier}:`,
         error
       );
-    });
+    }
   }
 
   // 10. Trigger agent if configured (fire and forget)
