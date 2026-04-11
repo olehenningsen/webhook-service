@@ -5,6 +5,15 @@
     },
     "src/app/api/callback/route.ts": {
       "maxDuration": 60
+    },
+    "src/app/api/cron/poll-sessions/route.ts": {
+      "maxDuration": 60
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/poll-sessions",
+      "schedule": "* * * * *"
+    }
+  ]
 }

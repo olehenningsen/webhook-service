@@ -1,5 +1,5 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { getEnv, getCallbackUrl } from "./config";
+import { getAgentConfig, getCallbackUrl } from "./config";
+import { createSession, sendEvent } from "./managed-agents";
 import { prisma } from "./prisma";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
 
@@ -17,14 +17,12 @@ interface TriggerInput {
 }
 
 /**
- * Trigger a managed agent via Claude API with retry logic.
- * Uses exponential backoff on transient failures.
+ * Trigger a managed agent session via Claude Managed Agents API.
+ * Creates a session and sends the initial user message with issue context.
+ * Returns immediately (fire-and-forget) — completion is detected by the cron poller.
  */
 export async function triggerAgent(input: TriggerInput): Promise<string | null> {
-  const env = getEnv();
-  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
-
-  const systemPrompt = buildSystemPrompt(input.agent);
+  const { agentId, environmentId } = getAgentConfig(input.agent);
   const userMessage = buildUserMessage(input);
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -39,30 +37,29 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
         },
       });
 
-      // TODO: Replace with actual managed agent API call when available.
-      // For now, use messages API as placeholder.
-      const response = await client.messages.create({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userMessage }],
-      });
+      // Create a managed agent session
+      const session = await createSession(
+        agentId,
+        environmentId,
+        `${input.issueId}: ${input.issueTitle}`
+      );
 
-      // Extract session ID (use message ID as placeholder)
-      const sessionId = response.id;
+      // Send the initial user message with issue context
+      await sendEvent(session.id, userMessage);
 
+      // Store the session ID for tracking by the cron poller
       await prisma.webhookEvent.update({
         where: { id: input.eventId },
         data: {
-          agentSessionId: sessionId,
+          agentSessionId: session.id,
         },
       });
 
       console.log(
-        `[agent-trigger] Agent '${input.agent}' triggered for ${input.issueId} (session: ${sessionId})`
+        `[agent-trigger] Agent '${input.agent}' session created for ${input.issueId} (session: ${session.id})`
       );
 
-      return sessionId;
+      return session.id;
     } catch (error) {
       const isLastAttempt = attempt === MAX_RETRIES;
       const errorMessage =
@@ -94,21 +91,6 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
   return null;
 }
 
-function buildSystemPrompt(agent: string): string {
-  // In production, this would load the agent's SKILL.md from the repo
-  const agentNames: Record<string, string> = {
-    saga: "Saga (Product Manager)",
-    atlas: "Atlas (Tech Lead)",
-    pixel: "Pixel (Frontend Developer)",
-    sprite: "Sprite (Frontend Developer)",
-    byte: "Byte (Backend Developer)",
-    loop: "Loop (Backend Developer)",
-    scout: "Scout (Tester)",
-  };
-
-  return `Du er ${agentNames[agent] ?? agent} i TeamAgentic. Et issue har skiftet status og kræver din opmærksomhed.`;
-}
-
 function buildUserMessage(input: TriggerInput): string {
   return [
     `## Issue: ${input.issueId} — ${input.issueTitle}`,
@@ -119,7 +101,8 @@ function buildUserMessage(input: TriggerInput): string {
       ? `## Beskrivelse\n\n${input.issueDescription}`
       : "",
     ``,
-    `Callback URL: ${getCallbackUrl()}`,
+    `Når du er færdig, vil systemet automatisk detektere at din session er idle.`,
+    `Callback URL (fallback): ${getCallbackUrl()}`,
   ]
     .filter(Boolean)
     .join("\n");

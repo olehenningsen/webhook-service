@@ -1,7 +1,7 @@
 import { prisma } from "./prisma";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
 
-const AGENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes (managed agents run longer)
 
 /**
  * Check if an agent is currently running on this issue.
