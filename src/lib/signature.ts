@@ -9,12 +9,20 @@ export function verifyLinearSignature(
   signature: string,
   secret: string
 ): boolean {
-  const hmac = crypto.createHmac("sha256", secret);
-  hmac.update(body);
-  const expectedSignature = hmac.digest("hex");
+  try {
+    const hmac = crypto.createHmac("sha256", secret);
+    hmac.update(body);
+    const expectedSignature = hmac.digest("hex");
 
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expectedSignature)
-  );
+    const sigBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+
+    if (sigBuffer.length !== expectedBuffer.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
+  } catch {
+    return false;
+  }
 }
