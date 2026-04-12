@@ -14,6 +14,9 @@ import {
 } from "@/types/linear-webhook";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
 
+// Allow up to 60s for session creation + retries
+export const maxDuration = 60;
+
 export async function POST(request: NextRequest) {
   const env = getEnv();
 
@@ -153,21 +156,23 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // 11. Trigger agent if configured (fire and forget)
+  // 11. Trigger agent if configured (must await to ensure retries complete before Vercel kills runtime)
   if (route.agent) {
-    triggerAgent({
-      eventId: event.id,
-      agent: route.agent,
-      issueId: payload.data.identifier,
-      issueTitle: payload.data.title,
-      issueDescription: payload.data.description,
-      toStatus,
-    }).catch((error) => {
+    try {
+      await triggerAgent({
+        eventId: event.id,
+        agent: route.agent,
+        issueId: payload.data.identifier,
+        issueTitle: payload.data.title,
+        issueDescription: payload.data.description,
+        toStatus,
+      });
+    } catch (error) {
       console.error(
-        `[webhook] Background agent trigger failed for ${payload.data.identifier}:`,
+        `[webhook] Agent trigger failed for ${payload.data.identifier}:`,
         error
       );
-    });
+    }
   }
 
   // 12. For git-only actions (no agent), the event is managed by executeGitAction
