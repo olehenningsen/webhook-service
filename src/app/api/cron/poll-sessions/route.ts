@@ -30,7 +30,6 @@ export async function GET(request: NextRequest) {
   const processingEvents = await prisma.webhookEvent.findMany({
     where: {
       status: WebhookEventStatus.PROCESSING,
-      agentSessionId: { not: null },
     },
   });
 
@@ -47,6 +46,38 @@ export async function GET(request: NextRequest) {
 
   for (const event of processingEvents) {
     try {
+      // If no session ID was ever saved, the trigger failed silently.
+      // Mark as FAILED after a grace period (2 minutes) to allow in-flight triggers to complete.
+      if (!event.agentSessionId) {
+        const elapsed = Date.now() - event.createdAt.getTime();
+        if (elapsed > 2 * 60 * 1000) {
+          await prisma.webhookEvent.update({
+            where: { id: event.id },
+            data: {
+              status: WebhookEventStatus.FAILED,
+              errorMessage: "Agent session was never created (no session ID after 2 min)",
+              processedAt: new Date(),
+            },
+          });
+
+          results.push({
+            eventId: event.id,
+            issueId: event.issueId,
+            sessionStatus: "orphaned",
+            action: "FAILED",
+          });
+
+          await dequeueNext(event.issueId);
+
+          if (DEVELOPER_POOL.includes(event.triggeredAgent as typeof DEVELOPER_POOL[number])) {
+            dispatchAvailableWork().catch((error) => {
+              console.error(`[poll-sessions] Orchestrator dispatch failed:`, error);
+            });
+          }
+        }
+        continue;
+      }
+
       // Check for timeout first
       const elapsed = Date.now() - event.createdAt.getTime();
       if (elapsed > AGENT_TIMEOUT_MS) {
