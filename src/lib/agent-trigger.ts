@@ -22,7 +22,7 @@ interface TriggerInput {
  * Returns immediately (fire-and-forget) — completion is detected by the cron poller.
  */
 export async function triggerAgent(input: TriggerInput): Promise<string | null> {
-  const { agentId, environmentId } = getAgentConfig(input.agent);
+  const { agentId, environmentId, vaultIds } = getAgentConfig(input.agent);
   const userMessage = buildUserMessage(input);
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -37,17 +37,17 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
         },
       });
 
-      // Create a managed agent session
+      // Create a managed agent session with vault credentials (MCP OAuth)
+      console.log(`[agent-trigger] Creating session for ${input.issueId} (agent: ${agentId}, env: ${environmentId}, vaults: ${vaultIds.join(",")})`);
       const session = await createSession(
         agentId,
         environmentId,
-        `${input.issueId}: ${input.issueTitle}`
+        `${input.issueId}: ${input.issueTitle}`,
+        vaultIds
       );
+      console.log(`[agent-trigger] Session created: ${session.id}`);
 
-      // Send the initial user message with issue context
-      await sendEvent(session.id, userMessage);
-
-      // Store the session ID for tracking by the cron poller
+      // Store the session ID immediately (before sendEvent, which may fail/timeout)
       await prisma.webhookEvent.update({
         where: { id: input.eventId },
         data: {
@@ -55,9 +55,10 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
         },
       });
 
-      console.log(
-        `[agent-trigger] Agent '${input.agent}' session created for ${input.issueId} (session: ${session.id})`
-      );
+      // Send the initial user message with issue context
+      console.log(`[agent-trigger] Sending initial message to ${session.id}`);
+      await sendEvent(session.id, userMessage);
+      console.log(`[agent-trigger] Message sent to ${session.id}`);
 
       return session.id;
     } catch (error) {

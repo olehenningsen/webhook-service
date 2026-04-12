@@ -78,16 +78,19 @@ async function apiRequest<T>(
 /**
  * Create a new agent session.
  * Returns immediately — the session runs asynchronously.
+ * vault_ids attaches credential vaults (e.g. MCP OAuth tokens) to the session.
  */
 export async function createSession(
   agentId: string,
   environmentId: string,
-  title?: string
+  title?: string,
+  vaultIds?: string[]
 ): Promise<SessionResponse> {
   return apiRequest<SessionResponse>("POST", "/v1/sessions", {
     agent: agentId,
     environment_id: environmentId,
     ...(title && { title }),
+    ...(vaultIds?.length && { vault_ids: vaultIds }),
   });
 }
 
@@ -133,6 +136,13 @@ export async function createAgent(
   input: CreateAgentInput
 ): Promise<AgentResponse> {
   return apiRequest<AgentResponse>("POST", "/v1/agents", input);
+}
+
+export async function updateAgent(
+  agentId: string,
+  input: Partial<CreateAgentInput>
+): Promise<AgentResponse> {
+  return apiRequest<AgentResponse>("PUT", `/v1/agents/${agentId}`, input);
 }
 
 // ─── Environments (used by setup script) ────────────────────

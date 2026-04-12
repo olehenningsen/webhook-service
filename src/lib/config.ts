@@ -45,6 +45,9 @@ const envSchema = z.object({
   // Environment IDs
   ENV_ID_PLANNING: z.string().optional(),
   ENV_ID_DEVELOPMENT: z.string().optional(),
+
+  // Vault IDs (MCP OAuth credentials)
+  VAULT_ID_MCP: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -73,6 +76,7 @@ export function getCallbackUrl(): string {
 export function getAgentConfig(agentName: string): {
   agentId: string;
   environmentId: string;
+  vaultIds: string[];
 } {
   const env = getEnv();
 
@@ -113,7 +117,15 @@ export function getAgentConfig(agentName: string): {
     );
   }
 
-  return { agentId, environmentId };
+  return { agentId, environmentId, vaultIds: getVaultIds() };
+}
+
+/**
+ * Get vault IDs for MCP credential injection into agent sessions.
+ */
+function getVaultIds(): string[] {
+  const env = getEnv();
+  return env.VAULT_ID_MCP ? [env.VAULT_ID_MCP.trim()] : [];
 }
 
 /**
