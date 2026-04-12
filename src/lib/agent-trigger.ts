@@ -1,4 +1,4 @@
-import { getAgentConfig, getCallbackUrl } from "./config";
+import { getAgentConfig, getCallbackUrl, getEnv } from "./config";
 import { createSession, sendEvent } from "./managed-agents";
 import { prisma } from "./prisma";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
@@ -93,6 +93,32 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
 }
 
 function buildUserMessage(input: TriggerInput): string {
+  const env = getEnv();
+  const githubToken = env.GITHUB_TOKEN;
+  const githubOwner = env.GITHUB_OWNER ?? "olehenningsen";
+
+  const gitSection = githubToken
+    ? [
+        `## GitHub-adgang (private repos)`,
+        ``,
+        `GitHub MCP-tokenet har **ikke** adgang til private repos. Brug i stedet git CLI med dette token:`,
+        ``,
+        "```bash",
+        `# Konfigurér git auth`,
+        `git config --global credential.helper store`,
+        `echo "https://x-access-token:${githubToken}@github.com" > ~/.git-credentials`,
+        `git config --global user.name "TeamAgentic Bot"`,
+        `git config --global user.email "bot@teamagentic.dev"`,
+        ``,
+        `# Klone repos:`,
+        `git clone https://x-access-token:${githubToken}@github.com/${githubOwner}/<repo>.git`,
+        "```",
+        ``,
+        `**Brug git CLI til alle repo-operationer** (clone, commit, push, branch). GitHub MCP kan stadig bruges til at søge, læse issues og oprette PRs.`,
+        ``,
+      ]
+    : [];
+
   return [
     `## Issue: ${input.issueId} — ${input.issueTitle}`,
     ``,
@@ -102,6 +128,7 @@ function buildUserMessage(input: TriggerInput): string {
       ? `## Beskrivelse\n\n${input.issueDescription}`
       : "",
     ``,
+    ...gitSection,
     `Når du er færdig, vil systemet automatisk detektere at din session er idle.`,
     `Callback URL (fallback): ${getCallbackUrl()}`,
   ]
