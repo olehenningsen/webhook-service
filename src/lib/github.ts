@@ -31,8 +31,12 @@ interface BranchResult {
 }
 
 /**
- * Create a feature branch from latest main.
+ * Create a feature branch from the repo's default branch.
  * Idempotent — returns existing branch if it already exists.
+ *
+ * NOTE: Agents typically create their own branches via git CLI on the mounted
+ * repo. This helper remains available for callers that pre-create a branch
+ * (e.g. tooling outside the standard agent flow).
  */
 export async function createFeatureBranch(params: {
   owner: string;
@@ -43,14 +47,15 @@ export async function createFeatureBranch(params: {
   const octokit = getOctokit();
   const slug = slugify(params.issueTitle);
   const branchName = `feat/${params.issueKey}-${slug}`;
+  const defaultBranch = await getDefaultBranch(params.owner, params.repo);
 
-  // Get latest main SHA
-  const { data: mainRef } = await octokit.rest.git.getRef({
+  // Get latest SHA of the default branch
+  const { data: baseRef } = await octokit.rest.git.getRef({
     owner: params.owner,
     repo: params.repo,
-    ref: "heads/main",
+    ref: `heads/${defaultBranch}`,
   });
-  const mainSha = mainRef.object.sha;
+  const baseSha = baseRef.object.sha;
 
   try {
     // Create branch
@@ -58,11 +63,11 @@ export async function createFeatureBranch(params: {
       owner: params.owner,
       repo: params.repo,
       ref: `refs/heads/${branchName}`,
-      sha: mainSha,
+      sha: baseSha,
     });
 
     console.log(
-      `[github] Created branch '${branchName}' from main (${mainSha.slice(0, 7)})`
+      `[github] Created branch '${branchName}' from ${defaultBranch} (${baseSha.slice(0, 7)})`
     );
   } catch (error: unknown) {
     // Branch already exists — that's fine (idempotent)
@@ -78,7 +83,7 @@ export async function createFeatureBranch(params: {
     throw error;
   }
 
-  return { branchName, sha: mainSha };
+  return { branchName, sha: baseSha };
 }
 
 // ─── Pull Request Operations ────────────────────────────────
@@ -112,9 +117,11 @@ export async function createPullRequest(params: {
 
   if (!branchName) {
     throw new Error(
-      `No branch found for ${params.issueKey}. Expected branch with prefix 'feat/${params.issueKey}-'`
+      `No branch found for ${params.issueKey}. Expected a branch with '${params.issueKey}' in its name.`
     );
   }
+
+  const defaultBranch = await getDefaultBranch(params.owner, params.repo);
 
   // Check if PR already exists (idempotent)
   const existingPR = await findIssuePR(
@@ -134,20 +141,20 @@ export async function createPullRequest(params: {
     };
   }
 
-  // Try to update branch with main (forward merge)
+  // Try to update branch with default branch (forward merge)
   try {
     await octokit.rest.repos.merge({
       owner: params.owner,
       repo: params.repo,
       base: branchName,
-      head: "main",
-      commit_message: `Merge main into ${branchName}`,
+      head: defaultBranch,
+      commit_message: `Merge ${defaultBranch} into ${branchName}`,
     });
-    console.log(`[github] Updated branch '${branchName}' with main`);
+    console.log(`[github] Updated branch '${branchName}' with ${defaultBranch}`);
   } catch (error: unknown) {
     if (isGitHubError(error) && error.status === 409) {
       throw new Error(
-        `Merge conflict: cannot update '${branchName}' with main. Manual resolution needed.`
+        `Merge conflict: cannot update '${branchName}' with ${defaultBranch}. Manual resolution needed.`
       );
     }
     // 204 No Content means already up to date — that's fine
@@ -165,7 +172,7 @@ export async function createPullRequest(params: {
       repo: params.repo,
       title: `[${params.issueKey}] ${params.issueTitle}`,
       head: branchName,
-      base: "main",
+      base: defaultBranch,
       body: [
         `## ${params.issueTitle}`,
         ``,
@@ -280,7 +287,14 @@ export async function autoMergePR(params: {
 // ─── Helpers ────────────────────────────────────────────────
 
 /**
- * Find the feature branch for an issue by prefix convention.
+ * Find the feature branch for an issue.
+ *
+ * Matches any branch whose name contains the issue key (case-insensitive),
+ * since agents may use various conventions like `feat/TEA-24-...`,
+ * `claude/tea-24-...`, `pixel/tea-24-...`, etc.
+ *
+ * Returns the most recently pushed matching branch. Excludes empty branches
+ * pointing at the default branch (these are pre-created stubs).
  */
 async function findIssueBranch(
   owner: string,
@@ -288,25 +302,40 @@ async function findIssueBranch(
   issueKey: string
 ): Promise<string | null> {
   const octokit = getOctokit();
-  const prefix = `feat/${issueKey}-`;
+  const needle = issueKey.toLowerCase();
 
   try {
-    // List branches matching the prefix
     const { data: branches } = await octokit.rest.repos.listBranches({
       owner,
       repo,
       per_page: 100,
     });
 
-    const match = branches.find((b) => b.name.startsWith(prefix));
-    return match?.name ?? null;
+    const defaultBranch = await getDefaultBranch(owner, repo);
+    const defaultSha = branches.find((b) => b.name === defaultBranch)?.commit
+      .sha;
+
+    const matches = branches.filter(
+      (b) =>
+        b.name.toLowerCase().includes(needle) &&
+        b.name !== defaultBranch &&
+        // Skip stub branches that just point at the default branch (no commits)
+        b.commit.sha !== defaultSha
+    );
+
+    if (matches.length === 0) return null;
+
+    // Prefer branches NOT starting with `feat/` if multiple match — agents
+    // typically use their own prefixes (claude/, pixel/, etc.) for real work.
+    const nonStub = matches.find((b) => !b.name.startsWith("feat/"));
+    return (nonStub ?? matches[0]).name;
   } catch {
     return null;
   }
 }
 
 /**
- * Find an open PR for an issue by branch prefix.
+ * Find an open PR for an issue by matching the issue key in the head branch name.
  */
 async function findIssuePR(
   owner: string,
@@ -314,7 +343,7 @@ async function findIssuePR(
   issueKey: string
 ): Promise<{ number: number; html_url: string; title: string; head: { ref: string } } | null> {
   const octokit = getOctokit();
-  const prefix = `feat/${issueKey}-`;
+  const needle = issueKey.toLowerCase();
 
   const { data: prs } = await octokit.rest.pulls.list({
     owner,
@@ -323,7 +352,7 @@ async function findIssuePR(
     per_page: 100,
   });
 
-  const match = prs.find((pr) => pr.head.ref.startsWith(prefix));
+  const match = prs.find((pr) => pr.head.ref.toLowerCase().includes(needle));
   return match
     ? {
         number: match.number,
@@ -332,6 +361,15 @@ async function findIssuePR(
         head: { ref: match.head.ref },
       }
     : null;
+}
+
+/**
+ * Fetch the repo's default branch (e.g. "main", "master").
+ */
+async function getDefaultBranch(owner: string, repo: string): Promise<string> {
+  const octokit = getOctokit();
+  const { data } = await octokit.rest.repos.get({ owner, repo });
+  return data.default_branch;
 }
 
 /**

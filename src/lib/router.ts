@@ -30,9 +30,9 @@ const STATUS_AGENT_MAP: Record<string, RouteResult> = {
   },
   "In Progress": {
     agent: null,
-    action: "git",
-    gitAction: "create-branch",
-    description: "Opret feature branch fra main",
+    action: "log",
+    description:
+      "Agenter laver selv deres branch via git CLI på den monterede repo",
   },
   Test: {
     agent: "scout",
