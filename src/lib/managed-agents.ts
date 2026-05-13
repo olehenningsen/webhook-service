@@ -75,22 +75,34 @@ async function apiRequest<T>(
 
 // ─── Sessions ───────────────────────────────────────────────
 
+export interface SessionResource {
+  type: "github_repository";
+  url: string;
+  mount_path: string;
+  authorization_token: string;
+}
+
 /**
  * Create a new agent session.
  * Returns immediately — the session runs asynchronously.
  * vault_ids attaches credential vaults (e.g. MCP OAuth tokens) to the session.
+ * resources mounts external resources (e.g. github repos) into the sandbox
+ * with auth baked into the local config — agent uses `git push` without ever
+ * handling the token.
  */
 export async function createSession(
   agentId: string,
   environmentId: string,
   title?: string,
-  vaultIds?: string[]
+  vaultIds?: string[],
+  resources?: SessionResource[]
 ): Promise<SessionResponse> {
   return apiRequest<SessionResponse>("POST", "/v1/sessions", {
     agent: agentId,
     environment_id: environmentId,
     ...(title && { title }),
     ...(vaultIds?.length && { vault_ids: vaultIds }),
+    ...(resources?.length && { resources }),
   });
 }
 

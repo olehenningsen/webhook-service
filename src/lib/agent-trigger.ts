@@ -1,5 +1,10 @@
-import { getAgentConfig, getCallbackUrl, getEnv } from "./config";
-import { createSession, sendEvent } from "./managed-agents";
+import {
+  getAgentConfig,
+  getCallbackUrl,
+  getGitHubConfig,
+  getRepoForTeam,
+} from "./config";
+import { createSession, sendEvent, type SessionResource } from "./managed-agents";
 import { prisma } from "./prisma";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
 
@@ -23,7 +28,9 @@ interface TriggerInput {
  */
 export async function triggerAgent(input: TriggerInput): Promise<string | null> {
   const { agentId, environmentId, vaultIds } = getAgentConfig(input.agent);
-  const userMessage = buildUserMessage(input);
+  const resources = buildResources();
+  const repoMount = resources[0]?.mount_path;
+  const userMessage = buildUserMessage(input, repoMount);
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -38,12 +45,15 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
       });
 
       // Create a managed agent session with vault credentials (MCP OAuth)
-      console.log(`[agent-trigger] Creating session for ${input.issueId} (agent: ${agentId}, env: ${environmentId}, vaults: ${vaultIds.join(",")})`);
+      // and a github_repository resource (auth baked into git remote — agent
+      // can `git push` without ever handling the token).
+      console.log(`[agent-trigger] Creating session for ${input.issueId} (agent: ${agentId}, env: ${environmentId}, vaults: ${vaultIds.join(",")}, resources: ${resources.length})`);
       const session = await createSession(
         agentId,
         environmentId,
         `${input.issueId}: ${input.issueTitle}`,
-        vaultIds
+        vaultIds,
+        resources
       );
       console.log(`[agent-trigger] Session created: ${session.id}`);
 
@@ -92,29 +102,38 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
   return null;
 }
 
-function buildUserMessage(input: TriggerInput): string {
-  const env = getEnv();
-  const githubToken = env.GITHUB_TOKEN;
-  const githubOwner = env.GITHUB_OWNER ?? "olehenningsen";
+/**
+ * Build session resources. Currently mounts the default GitHub repo so the
+ * agent can run `git push` directly — the auth token is baked into the local
+ * git remote by the managed agents platform.
+ *
+ * Returns [] if GitHub config is incomplete (allows non-code agents to run).
+ */
+function buildResources(): SessionResource[] {
+  try {
+    const { token, owner, defaultRepo } = getGitHubConfig();
+    const repo = getRepoForTeam();
+    return [
+      {
+        type: "github_repository",
+        url: `https://github.com/${owner}/${repo}`,
+        mount_path: `/workspace/${repo}`,
+        authorization_token: token,
+      },
+    ];
+  } catch {
+    return [];
+  }
+}
 
-  const gitSection = githubToken
+function buildUserMessage(input: TriggerInput, repoMount?: string): string {
+  const repoSection = repoMount
     ? [
-        `## GitHub-adgang (private repos)`,
+        `## Repository`,
         ``,
-        `GitHub MCP-tokenet har **ikke** adgang til private repos. Brug i stedet git CLI med dette token:`,
+        `Repoet er allerede klonet og klar i \`${repoMount}\`. Git-autentificering er konfigureret — du kan **direkte** køre \`git checkout -b ...\`, \`git commit\`, og \`git push\` fra den mappe uden at sætte credentials op.`,
         ``,
-        "```bash",
-        `# Konfigurér git auth`,
-        `git config --global credential.helper store`,
-        `echo "https://x-access-token:${githubToken}@github.com" > ~/.git-credentials`,
-        `git config --global user.name "TeamAgentic Bot"`,
-        `git config --global user.email "bot@teamagentic.dev"`,
-        ``,
-        `# Klone repos:`,
-        `git clone https://x-access-token:${githubToken}@github.com/${githubOwner}/<repo>.git`,
-        "```",
-        ``,
-        `**Brug git CLI til alle repo-operationer** (clone, commit, push, branch). GitHub MCP kan stadig bruges til at søge, læse issues og oprette PRs.`,
+        `Brug GitHub MCP til at oprette pull requests efter push.`,
         ``,
       ]
     : [];
@@ -128,7 +147,7 @@ function buildUserMessage(input: TriggerInput): string {
       ? `## Beskrivelse\n\n${input.issueDescription}`
       : "",
     ``,
-    ...gitSection,
+    ...repoSection,
     `Når du er færdig, vil systemet automatisk detektere at din session er idle.`,
     `Callback URL (fallback): ${getCallbackUrl()}`,
   ]
