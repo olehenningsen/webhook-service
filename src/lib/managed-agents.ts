@@ -46,6 +46,8 @@ function getHeaders(): Record<string, string> {
   };
 }
 
+const REQUEST_TIMEOUT_MS = 30_000;
+
 async function apiRequest<T>(
   method: string,
   path: string,
@@ -55,6 +57,10 @@ async function apiRequest<T>(
   const options: RequestInit = {
     method,
     headers: getHeaders(),
+    // Bound every request — without this, a hanging fetch silently dies
+    // when Vercel kills the function runtime, leaving orphan sessions
+    // (e.g. session created but initial sendEvent never delivered).
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   };
 
   if (body) {
@@ -71,6 +77,26 @@ async function apiRequest<T>(
   }
 
   return response.json() as Promise<T>;
+}
+
+/**
+ * List events for a session. Used to verify that a sendEvent call
+ * actually delivered (sometimes the POST succeeds but the message
+ * never lands).
+ */
+interface EventListResponse {
+  data: Array<{ type: string; id: string }>;
+}
+
+export async function listSessionEvents(
+  sessionId: string,
+  limit = 5
+): Promise<EventListResponse["data"]> {
+  const res = await apiRequest<EventListResponse>(
+    "GET",
+    `/v1/sessions/${sessionId}/events?limit=${limit}`
+  );
+  return res.data ?? [];
 }
 
 // ─── Sessions ───────────────────────────────────────────────
