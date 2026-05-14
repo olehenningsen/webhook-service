@@ -213,6 +213,34 @@ export async function getOrCreateLabel(
 }
 
 /**
+ * Add a label to an issue by its identifier (e.g. "TEA-67").
+ * Looks up the issue, then delegates to addLabelToIssue.
+ * No-op if the issue can't be found.
+ */
+export async function addLabelByIssueKey(
+  issueIdentifier: string,
+  labelName: string,
+  labelColor?: string
+): Promise<void> {
+  const client = getLinearClient();
+  const results = await client.searchIssues(issueIdentifier, { first: 1 });
+  const found = results.nodes[0];
+  if (!found) {
+    console.warn(`[linear-client] addLabelByIssueKey: ${issueIdentifier} not found`);
+    return;
+  }
+  // searchIssues returns IssueSearchResult which lacks some Issue methods —
+  // fetch the full Issue by ID so addLabelToIssue can call issue.labels() etc.
+  const issue = await client.issue(found.id);
+  const team = await issue.team;
+  if (!team) {
+    console.warn(`[linear-client] addLabelByIssueKey: ${issueIdentifier} has no team`);
+    return;
+  }
+  await addLabelToIssue(issue, team.id, labelName, labelColor);
+}
+
+/**
  * Add a label to an issue (preserves existing labels).
  */
 export async function addLabelToIssue(

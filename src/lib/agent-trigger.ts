@@ -3,14 +3,24 @@ import {
   getCallbackUrl,
   getGitHubConfig,
   getRepoForTeam,
+  DEVELOPER_POOL,
 } from "./config";
 import {
   createSession,
   sendEvent,
   type SessionResource,
 } from "./managed-agents";
+import { addLabelByIssueKey } from "./linear-client";
 import { prisma } from "./prisma";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
+
+// Colors for the non-developer agents' dev:* labels. Developer-pool agents
+// have their own colors set by the orchestrator.
+const NON_DEV_LABEL_COLORS: Record<string, string> = {
+  saga: "#9B59B6",   // purple — PM
+  atlas: "#3498DB",  // blue — tech lead
+  scout: "#E74C3C",  // red — tester
+};
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
@@ -49,6 +59,28 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
           retryCount: attempt,
         },
       });
+
+      // For Saga/Atlas/Scout, add a dev:<agent> label so the dashboard sees
+      // them as active on this issue. Developer-pool agents (Pixel, Sprite,
+      // Byte, Loop) already get this label from the orchestrator when it
+      // dispatches them; this branch covers the agents that get triggered
+      // directly by status changes (Refinement → Saga, Specification → Atlas,
+      // Test → Scout). Best-effort — failures are non-fatal.
+      const isDeveloper = (DEVELOPER_POOL as readonly string[]).includes(input.agent);
+      if (!isDeveloper && attempt === 0) {
+        try {
+          await addLabelByIssueKey(
+            input.issueId,
+            `dev:${input.agent}`,
+            NON_DEV_LABEL_COLORS[input.agent]
+          );
+        } catch (labelError) {
+          console.warn(
+            `[agent-trigger] Failed to add dev:${input.agent} label to ${input.issueId}:`,
+            labelError
+          );
+        }
+      }
 
       // Create a managed agent session with vault credentials (MCP OAuth)
       // and a github_repository resource (auth baked into git remote — agent
