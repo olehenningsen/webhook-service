@@ -3,6 +3,7 @@ import {
   createFeatureBranch,
   createPullRequest,
   autoMergePR,
+  closePR,
 } from "./github";
 import { addIssueComment } from "./linear-client";
 import { prisma } from "./prisma";
@@ -11,7 +12,7 @@ import { WebhookEventStatus } from "@/generated/prisma/enums";
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 
-export type GitAction = "create-branch" | "create-pr" | "auto-merge";
+export type GitAction = "create-branch" | "create-pr" | "auto-merge" | "close-pr";
 
 interface GitWorkflowInput {
   eventId: string;
@@ -100,6 +101,21 @@ export async function executeGitAction(
             resultMessage = `Merged PR #${result.prNumber} (squash): ${result.sha?.slice(0, 7)}`;
           } else {
             resultMessage = "No PR to merge";
+          }
+          break;
+        }
+
+        case "close-pr": {
+          const result = await closePR({
+            owner,
+            repo,
+            issueKey: input.issueKey,
+          });
+
+          if (result.closed) {
+            resultMessage = `Closed PR #${result.prNumber} and deleted branch (issue Cancelled)`;
+          } else {
+            resultMessage = "No open PR found for Cancelled issue — nothing to do";
           }
           break;
         }

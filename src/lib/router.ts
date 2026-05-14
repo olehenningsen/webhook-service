@@ -58,8 +58,10 @@ const STATUS_AGENT_MAP: Record<string, RouteResult> = {
   },
   Canceled: {
     agent: null,
-    action: "log",
-    description: "Issue annulleret — kun log",
+    action: "git",
+    gitAction: "close-pr",
+    description:
+      "Issue annulleret — luk evt. åben PR og slet feature-branchen",
   },
   Duplicate: {
     agent: null,

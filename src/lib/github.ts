@@ -284,6 +284,63 @@ export async function autoMergePR(params: {
   }
 }
 
+// ─── Close PR (for Cancelled issues) ───────────────────────
+
+interface ClosePRResult {
+  closed: boolean;
+  prNumber?: number;
+  reason: "closed" | "no_pr" | "already_closed";
+}
+
+/**
+ * Close (without merging) the PR for an issue and delete the branch.
+ * Used when an issue is moved to Cancelled — we don't want to merge,
+ * but we should clean up to keep the repo tidy.
+ */
+export async function closePR(params: {
+  owner: string;
+  repo: string;
+  issueKey: string;
+}): Promise<ClosePRResult> {
+  const octokit = getOctokit();
+
+  const pr = await findIssuePR(params.owner, params.repo, params.issueKey);
+  if (!pr) {
+    return { closed: false, reason: "no_pr" };
+  }
+
+  const branchName = pr.head.ref;
+
+  // Close the PR (state=closed without merge)
+  await octokit.rest.pulls.update({
+    owner: params.owner,
+    repo: params.repo,
+    pull_number: pr.number,
+    state: "closed",
+  });
+
+  console.log(
+    `[github] Closed PR #${pr.number} for ${params.issueKey} (issue Cancelled)`
+  );
+
+  // Delete the branch (best-effort)
+  try {
+    await octokit.rest.git.deleteRef({
+      owner: params.owner,
+      repo: params.repo,
+      ref: `heads/${branchName}`,
+    });
+    console.log(`[github] Deleted branch '${branchName}'`);
+  } catch (deleteError) {
+    console.warn(
+      `[github] Failed to delete branch '${branchName}':`,
+      deleteError
+    );
+  }
+
+  return { closed: true, prNumber: pr.number, reason: "closed" };
+}
+
 // ─── Helpers ────────────────────────────────────────────────
 
 /**
