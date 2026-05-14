@@ -108,12 +108,17 @@ export async function executeGitAction(
           resultMessage = `Unknown git action: ${input.action}`;
       }
 
-      // Mark as completed
+      // Mark as completed.
+      // IMPORTANT: do NOT write to agentSessionId here — it's reserved for the
+      // Anthropic session ID set by triggerAgent. When a route triggers both a
+      // git action and an agent (e.g. Test: create-pr + scout), git-workflow
+      // and agent-trigger may run on the same event row. Writing the git
+      // result message here would clobber the session ID stored by triggerAgent,
+      // making the cron poller unable to detect agent completion.
       await prisma.webhookEvent.update({
         where: { id: input.eventId },
         data: {
           status: WebhookEventStatus.COMPLETED,
-          agentSessionId: resultMessage,
           processedAt: new Date(),
         },
       });
