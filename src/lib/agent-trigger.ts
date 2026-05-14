@@ -30,7 +30,9 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
   const { agentId, environmentId, vaultIds } = getAgentConfig(input.agent);
   const resources = buildResources();
   const repoMount = resources[0]?.mount_path;
-  const userMessage = buildUserMessage(input, repoMount);
+  const repoUrl = resources[0]?.url;
+  const fallbackToken = resources[0]?.authorization_token;
+  const userMessage = buildUserMessage(input, repoMount, repoUrl, fallbackToken);
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -126,15 +128,35 @@ function buildResources(): SessionResource[] {
   }
 }
 
-function buildUserMessage(input: TriggerInput, repoMount?: string): string {
+function buildUserMessage(
+  input: TriggerInput,
+  repoMount?: string,
+  repoUrl?: string,
+  fallbackToken?: string
+): string {
   const repoSection = repoMount
     ? [
         `## Repository`,
         ``,
-        `Repoet er allerede klonet og klar i \`${repoMount}\`. Git-autentificering er konfigureret — du kan **direkte** køre \`git checkout -b ...\`, \`git commit\`, og \`git push\` fra den mappe uden at sætte credentials op.`,
+        `Repoet er allerede klonet og klar i \`${repoMount}\`. Standard \`origin\` remote har autentificering indbygget — du kan **direkte** køre \`git checkout -b ...\`, \`git commit\`, og \`git push\` fra den mappe.`,
         ``,
-        `Brug GitHub MCP til at oprette pull requests efter push.`,
+        `**Webhook-service håndterer PR-oprettelse og merge automatisk** når du flytter issuet til Test (og senere Done). Du skal IKKE oprette PR selv — brug ikke GitHub MCP (den er heller ikke tilgængelig).`,
         ``,
+        ...(fallbackToken && repoUrl
+          ? [
+              `### Fallback hvis \`git push origin\` fejler`,
+              ``,
+              `Den lokale auth-proxy kan time ud efter inaktivitet. Hvis push fejler med \`Failed to connect to 127.0.0.1\` eller lignende, brug PAT'en direkte:`,
+              ``,
+              "```bash",
+              `git remote set-url origin ${repoUrl.replace("https://", `https://x-access-token:${fallbackToken}@`)}.git`,
+              `git push -u origin <din-branch>`,
+              "```",
+              ``,
+              `Denne PAT har \`repo\` scope. Brug ALDRIG denne i kommentarer, commits eller kode — kun til at sætte git remote.`,
+              ``,
+            ]
+          : []),
       ]
     : [];
 
