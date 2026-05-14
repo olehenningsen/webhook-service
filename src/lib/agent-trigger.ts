@@ -7,7 +7,6 @@ import {
 import {
   createSession,
   sendEvent,
-  listSessionEvents,
   type SessionResource,
 } from "./managed-agents";
 import { prisma } from "./prisma";
@@ -74,19 +73,13 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
       // garbage-collects it.
       console.log(`[agent-trigger] Sending initial message to ${session.id}`);
       await sendEvent(session.id, userMessage);
+      console.log(`[agent-trigger] Message sent to ${session.id}`);
 
-      // Verify the message actually landed — sendEvent has been observed to
-      // return success while the message was never delivered. Read back the
-      // events list and confirm at least one event exists.
-      const events = await listSessionEvents(session.id, 3);
-      if (events.length === 0) {
-        throw new Error(
-          `sendEvent returned OK but session ${session.id} has 0 events — message not delivered`
-        );
-      }
-      console.log(`[agent-trigger] Verified ${events.length} event(s) in ${session.id}`);
-
-      // Now safe to persist the session ID — the message is live in Anthropic.
+      // Now safe to persist the session ID — sendEvent's HTTP response is
+      // authoritative. (We previously had a verification step that polled
+      // GET events here, but it ran into eventual-consistency: messages
+      // freshly POSTed aren't always immediately visible via GET, causing
+      // false-negative throws on a working session.)
       await prisma.webhookEvent.update({
         where: { id: input.eventId },
         data: {
