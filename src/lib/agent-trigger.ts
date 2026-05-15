@@ -95,29 +95,24 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
       );
       console.log(`[agent-trigger] Session created: ${session.id}`);
 
-      // Send the initial user message BEFORE storing agentSessionId.
-      // Previously we stored the ID first as a "safety net" — but the
-      // consequence was that when sendEvent silently failed (Vercel runtime
-      // cut-off, hanging fetch, etc.) we ended up with orphan empty sessions
-      // visible to the cron poller as "real" running sessions. Now: if
-      // sendEvent fails, we throw before storing, the retry loop tries again,
-      // and the orphan session in Anthropic just sits idle until its env TTL
-      // garbage-collects it.
-      console.log(`[agent-trigger] Sending initial message to ${session.id}`);
-      await sendEvent(session.id, userMessage);
-      console.log(`[agent-trigger] Message sent to ${session.id}`);
-
-      // Now safe to persist the session ID — sendEvent's HTTP response is
-      // authoritative. (We previously had a verification step that polled
-      // GET events here, but it ran into eventual-consistency: messages
-      // freshly POSTed aren't always immediately visible via GET, causing
-      // false-negative throws on a working session.)
+      // Persist agentSessionId BEFORE sendEvent. If sendEvent throws (Vercel
+      // runtime cut-off, hanging fetch, transient API error), the session
+      // still exists in Anthropic with 0 events — the cron poller's
+      // empty-session recovery (poll-sessions/route.ts) catches both
+      // `running` and `idle` empty sessions and resends the initial message.
+      // Without persisting the ID first, an aborted sendEvent leaves the
+      // session orphaned in Anthropic with no way for cron to find it, and
+      // the work is silently dropped until manual intervention.
       await prisma.webhookEvent.update({
         where: { id: input.eventId },
         data: {
           agentSessionId: session.id,
         },
       });
+
+      console.log(`[agent-trigger] Sending initial message to ${session.id}`);
+      await sendEvent(session.id, userMessage);
+      console.log(`[agent-trigger] Message sent to ${session.id}`);
 
       return session.id;
     } catch (error) {
