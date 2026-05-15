@@ -47,10 +47,17 @@ export async function GET(request: NextRequest) {
   for (const event of processingEvents) {
     try {
       // If no session ID was ever saved, the trigger failed silently.
-      // Mark as FAILED after a grace period (2 minutes) to allow in-flight triggers to complete.
+      // Mark as FAILED after a generous grace period — Anthropic sandbox
+      // provisioning under load can take 3-10 minutes, and agent-trigger's
+      // orphan-recovery probes (PR #7) only succeed once the orphan session
+      // appears in Anthropic's list. Firing FAILED too early races against
+      // that recovery and leaves an inconsistent row state. 10 minutes is
+      // well past the worst case we've observed and still fast enough to
+      // surface genuinely broken triggers (e.g. bad auth) within an
+      // operational window.
       if (!event.agentSessionId) {
         const elapsed = Date.now() - event.createdAt.getTime();
-        if (elapsed > 2 * 60 * 1000) {
+        if (elapsed > 10 * 60 * 1000) {
           await prisma.webhookEvent.update({
             where: { id: event.id },
             data: {
