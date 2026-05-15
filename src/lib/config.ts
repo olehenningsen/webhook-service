@@ -121,12 +121,12 @@ export function getAgentConfig(agentName: string): {
     );
   }
 
-  // Saga uses only Linear MCP (configured at agent-level), no GitHub MCP,
-  // and therefore no vault credentials. Skip vault_ids to keep her session
-  // payload minimal and avoid unrelated vault state coupling.
-  const vaultIds = agentName === "saga" ? [] : getVaultIds();
-
-  return { agentId, environmentId, vaultIds };
+  // NOTE: All agents (including Saga) need vault_ids — Linear MCP at
+  // mcp.linear.app/mcp authenticates via OAuth credentials injected from the
+  // vault. A previous optimization to skip vault for Saga broke her Linear
+  // MCP access (observed on TEA-61 — she made 0 MCP calls and hallucinated
+  // having posted PRDs / moved state).
+  return { agentId, environmentId, vaultIds: getVaultIds() };
 }
 
 /**
