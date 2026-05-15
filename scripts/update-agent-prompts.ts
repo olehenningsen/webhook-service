@@ -66,9 +66,17 @@ async function updateAgentSystem(agentId: string, version: number, system: strin
 }
 
 // ─── Read SKILL.md files ──────────────────────────────────
+// Paths are configurable via env vars (AGENTS_DIR, TEMPLATES_DIR) so the
+// script works from any checkout layout. Default is the conventional
+// sibling-directory layout: webhook-service and "Claude Dev TeamAgentic"
+// share a parent folder.
 
-const AGENTS_DIR = path.resolve(__dirname, "../../Claude Dev TeamAgentic/agents");
-const TEMPLATES_DIR = path.resolve(__dirname, "../../Claude Dev TeamAgentic/templates");
+const AGENTS_DIR =
+  process.env.AGENTS_DIR ??
+  path.resolve(__dirname, "../../Claude Dev TeamAgentic/agents");
+const TEMPLATES_DIR =
+  process.env.TEMPLATES_DIR ??
+  path.resolve(__dirname, "../../Claude Dev TeamAgentic/templates");
 
 function readFile(filePath: string): string {
   return fs.readFileSync(filePath, "utf-8");

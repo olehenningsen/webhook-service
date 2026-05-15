@@ -29,6 +29,10 @@ const envSchema = z.object({
   GITHUB_TOKEN: z.string().optional(),
   GITHUB_OWNER: z.string().optional(),
   GITHUB_DEFAULT_REPO: z.string().optional(),
+  // Optional JSON map for routing Linear teams/projects to specific repos:
+  //   { "team:TEA": "agent-dashboard", "project:Foo": "foo-repo" }
+  // Falls back to GITHUB_DEFAULT_REPO when no entry matches.
+  GITHUB_REPO_MAP: z.string().optional(),
 
   // Linear API (for write-back: comments, status changes)
   LINEAR_API_KEY: z.string().optional(),
@@ -117,7 +121,12 @@ export function getAgentConfig(agentName: string): {
     );
   }
 
-  return { agentId, environmentId, vaultIds: getVaultIds() };
+  // Saga uses only Linear MCP (configured at agent-level), no GitHub MCP,
+  // and therefore no vault credentials. Skip vault_ids to keep her session
+  // payload minimal and avoid unrelated vault state coupling.
+  const vaultIds = agentName === "saga" ? [] : getVaultIds();
+
+  return { agentId, environmentId, vaultIds };
 }
 
 /**
@@ -126,6 +135,44 @@ export function getAgentConfig(agentName: string): {
 function getVaultIds(): string[] {
   const env = getEnv();
   return env.VAULT_ID_MCP ? [env.VAULT_ID_MCP.trim()] : [];
+}
+
+/**
+ * Parse GITHUB_REPO_MAP env var into a Record<string, string>.
+ * Returns an empty map on missing or invalid input — no parse failure is fatal.
+ * Memoized so we don't re-parse on every call.
+ */
+let _repoMap: Record<string, string> | null = null;
+function getRepoMap(): Record<string, string> {
+  if (_repoMap !== null) return _repoMap;
+
+  const raw = getEnv().GITHUB_REPO_MAP;
+  if (!raw) {
+    _repoMap = {};
+    return _repoMap;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      console.warn("[config] GITHUB_REPO_MAP must be a JSON object — ignoring");
+      _repoMap = {};
+      return _repoMap;
+    }
+    const clean: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === "string") {
+        clean[k] = v;
+      } else {
+        console.warn(`[config] GITHUB_REPO_MAP: skipping non-string value for '${k}'`);
+      }
+    }
+    _repoMap = clean;
+  } catch (error) {
+    console.warn("[config] GITHUB_REPO_MAP is invalid JSON — ignoring:", error);
+    _repoMap = {};
+  }
+  return _repoMap;
 }
 
 /**
@@ -156,11 +203,29 @@ export function getGitHubConfig(): {
 }
 
 /**
- * Resolve the GitHub repo for a Linear team key.
- * Currently all TEA issues map to the default repo.
+ * Resolve the GitHub repo for a Linear team key (and optionally a project name).
+ *
+ * Lookup order:
+ *   1. `project:<projectName>` in GITHUB_REPO_MAP
+ *   2. `team:<teamKey>` in GITHUB_REPO_MAP
+ *   3. GITHUB_DEFAULT_REPO (fallback)
+ *
+ * GITHUB_REPO_MAP is an optional JSON env var, e.g.:
+ *   {"team:TEA": "agent-dashboard", "project:Mobile App": "mobile-app"}
+ *
+ * Invalid JSON is logged and treated as an empty map (no breakage).
  */
-export function getRepoForTeam(teamKey?: string): string {
+export function getRepoForTeam(teamKey?: string, projectName?: string): string {
   const { defaultRepo } = getGitHubConfig();
-  // Expand this map when multiple repos are needed
+  const map = getRepoMap();
+
+  if (projectName) {
+    const hit = map[`project:${projectName}`];
+    if (hit) return hit;
+  }
+  if (teamKey) {
+    const hit = map[`team:${teamKey}`];
+    if (hit) return hit;
+  }
   return defaultRepo;
 }

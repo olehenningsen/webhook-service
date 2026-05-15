@@ -257,21 +257,15 @@ export async function autoMergePR(params: {
       `[github] Merged PR #${pr.number} (squash) for ${params.issueKey}: ${merge.sha}`
     );
 
-    // Delete the branch
-    try {
-      await octokit.rest.git.deleteRef({
-        owner: params.owner,
-        repo: params.repo,
-        ref: `heads/${branchName}`,
-      });
-      console.log(`[github] Deleted branch '${branchName}'`);
-    } catch (deleteError) {
-      console.warn(
-        `[github] Failed to delete branch '${branchName}':`,
-        deleteError
-      );
-      // Non-fatal — branch cleanup is nice-to-have
-    }
+    // Delete the branch, then verify it's actually gone — sometimes the API
+    // accepts the delete but the branch lingers (transient consistency or a
+    // protected-branch policy). If it's still there, retry delete once.
+    await deleteBranchWithVerify(
+      octokit,
+      params.owner,
+      params.repo,
+      branchName
+    );
 
     return { merged: true, sha: merge.sha, prNumber: pr.number };
   } catch (error: unknown) {
@@ -345,19 +339,7 @@ export async function closePR(params: {
   );
 
   for (const b of matchingBranches) {
-    try {
-      await octokit.rest.git.deleteRef({
-        owner: params.owner,
-        repo: params.repo,
-        ref: `heads/${b.name}`,
-      });
-      console.log(`[github] Deleted branch '${b.name}'`);
-    } catch (deleteError) {
-      console.warn(
-        `[github] Failed to delete branch '${b.name}':`,
-        deleteError
-      );
-    }
+    await deleteBranchWithVerify(octokit, params.owner, params.repo, b.name);
   }
 
   if (matchingPRs.length === 0 && matchingBranches.length === 0) {
@@ -469,4 +451,59 @@ function isGitHubError(error: unknown): error is { status: number; message: stri
     "status" in error &&
     typeof (error as Record<string, unknown>).status === "number"
   );
+}
+
+/**
+ * Delete a branch, then verify it's actually gone. If it's still there after
+ * the delete call returns success (transient consistency / protected-branch
+ * silent failure), retry once. All failures are non-fatal — log + move on.
+ */
+async function deleteBranchWithVerify(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  branchName: string
+): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await octokit.rest.git.deleteRef({ owner, repo, ref: `heads/${branchName}` });
+    } catch (deleteError) {
+      // 422 "Reference does not exist" means it's already gone — success.
+      if (isGitHubError(deleteError) && deleteError.status === 422) {
+        console.log(`[github] Branch '${branchName}' already deleted`);
+        return;
+      }
+      console.warn(
+        `[github] deleteRef '${branchName}' (attempt ${attempt + 1}) failed:`,
+        deleteError
+      );
+      // Fall through to verify — maybe it succeeded anyway.
+    }
+
+    // Verify by trying to fetch the branch — expect 404.
+    try {
+      await octokit.rest.repos.getBranch({ owner, repo, branch: branchName });
+      // Still exists — log and (on first attempt) retry the delete.
+      if (attempt === 0) {
+        console.warn(
+          `[github] Branch '${branchName}' still exists after delete — retrying`
+        );
+        continue;
+      }
+      console.warn(
+        `[github] Branch '${branchName}' still exists after retry — giving up`
+      );
+    } catch (getError) {
+      if (isGitHubError(getError) && getError.status === 404) {
+        console.log(`[github] Deleted branch '${branchName}'`);
+        return;
+      }
+      // Unexpected error verifying — log and stop. Branch may or may not be gone.
+      console.warn(
+        `[github] Could not verify deletion of '${branchName}':`,
+        getError
+      );
+      return;
+    }
+  }
 }
