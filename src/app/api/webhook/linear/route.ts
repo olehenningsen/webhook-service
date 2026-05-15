@@ -136,10 +136,25 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // 10. Execute git action if configured (await — fast enough for Vercel timeout)
+  // 10-11. Run git action and agent trigger IN PARALLEL when both are configured.
+  // Sequential awaiting (git first, then agent) was eating into the Vercel 60s
+  // function budget — slow git operations (PR creation with merge-from-main
+  // taking 10-30s) left too little time for triggerAgent's sendEvent to
+  // complete, causing the "empty Scout session" bug where the session was
+  // created but the initial message never landed. Promise.allSettled lets
+  // them race; total runtime is now max(git, trigger) ≈ git, not git + trigger.
+  //
+  // Side effects: both write to the same webhook event row (status,
+  // triggeredAgent, agentSessionId). Order of writes is non-deterministic,
+  // but:
+  //   - triggerAgent owns agentSessionId (git-workflow no longer writes it)
+  //   - last-write-wins on status is acceptable; the cron poller derives true
+  //     state from the Anthropic session anyway
+  const tasks: Promise<void>[] = [];
+
   if (route.gitAction) {
-    try {
-      await executeGitAction({
+    tasks.push(
+      executeGitAction({
         eventId: event.id,
         action: route.gitAction,
         issueKey: payload.data.identifier,
@@ -147,32 +162,39 @@ export async function POST(request: NextRequest) {
         issueDescription: payload.data.description,
         teamKey: payload.data.team?.key,
         labels: payload.data.labels?.map((l) => l.name),
-      });
-    } catch (error) {
-      console.error(
-        `[webhook] Git action '${route.gitAction}' failed for ${payload.data.identifier}:`,
-        error
-      );
-    }
+      }).catch((error) => {
+        console.error(
+          `[webhook] Git action '${route.gitAction}' failed for ${payload.data.identifier}:`,
+          error
+        );
+      })
+    );
   }
 
-  // 11. Trigger agent if configured (must await to ensure retries complete before Vercel kills runtime)
   if (route.agent) {
-    try {
-      await triggerAgent({
-        eventId: event.id,
-        agent: route.agent,
-        issueId: payload.data.identifier,
-        issueTitle: payload.data.title,
-        issueDescription: payload.data.description,
-        toStatus,
-      });
-    } catch (error) {
-      console.error(
-        `[webhook] Agent trigger failed for ${payload.data.identifier}:`,
-        error
-      );
-    }
+    tasks.push(
+      (async () => {
+        try {
+          await triggerAgent({
+            eventId: event.id,
+            agent: route.agent!,
+            issueId: payload.data.identifier,
+            issueTitle: payload.data.title,
+            issueDescription: payload.data.description,
+            toStatus,
+          });
+        } catch (error) {
+          console.error(
+            `[webhook] Agent trigger failed for ${payload.data.identifier}:`,
+            error
+          );
+        }
+      })()
+    );
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
   }
 
   // 12. For git-only actions (no agent), the event is managed by executeGitAction

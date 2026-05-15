@@ -62,6 +62,22 @@ export async function getTodoIssues(teamKey: string): Promise<Issue[]> {
 }
 
 /**
+ * Check if an issue is a "parent wrapper" — has child issues that aren't all Done.
+ * Parent issues should NOT be dispatched to developers, since their actual
+ * implementation work lives in the sub-issues. Returns true if the issue has
+ * any children and at least one is not Done.
+ */
+export async function hasUnfinishedChildren(issue: Issue): Promise<boolean> {
+  const children = await issue.children();
+  if (children.nodes.length === 0) return false;
+  for (const child of children.nodes) {
+    const state = await child.state;
+    if (!state || state.name !== "Done") return true;
+  }
+  return false;
+}
+
+/**
  * Check if all blockers for an issue are Done.
  * Returns { resolved: true } if no blockers or all blockers are Done.
  * Uses inverseRelations (issues that block this one).

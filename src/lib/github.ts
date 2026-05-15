@@ -293,9 +293,13 @@ interface ClosePRResult {
 }
 
 /**
- * Close (without merging) the PR for an issue and delete the branch.
- * Used when an issue is moved to Cancelled — we don't want to merge,
- * but we should clean up to keep the repo tidy.
+ * Close (without merging) any open PRs for an issue and delete ALL branches
+ * that contain the issue key in their name. Used when an issue is moved to
+ * Cancelled — we don't want to merge, but we should clean up the repo.
+ *
+ * Multi-branch cleanup: agents sometimes push to multiple branches for the
+ * same issue (e.g. `claude/tea-XX-...` + `feat/TEA-XX-...`). Earlier
+ * versions only handled the PR's own branch; this version finds all matches.
  */
 export async function closePR(params: {
   owner: string;
@@ -303,42 +307,68 @@ export async function closePR(params: {
   issueKey: string;
 }): Promise<ClosePRResult> {
   const octokit = getOctokit();
+  const needle = params.issueKey.toLowerCase();
 
-  const pr = await findIssuePR(params.owner, params.repo, params.issueKey);
-  if (!pr) {
-    return { closed: false, reason: "no_pr" };
-  }
-
-  const branchName = pr.head.ref;
-
-  // Close the PR (state=closed without merge)
-  await octokit.rest.pulls.update({
+  // Close all open PRs that match this issue key (usually 0 or 1)
+  const { data: openPRs } = await octokit.rest.pulls.list({
     owner: params.owner,
     repo: params.repo,
-    pull_number: pr.number,
-    state: "closed",
+    state: "open",
+    per_page: 100,
   });
-
-  console.log(
-    `[github] Closed PR #${pr.number} for ${params.issueKey} (issue Cancelled)`
+  const matchingPRs = openPRs.filter((pr) =>
+    pr.head.ref.toLowerCase().includes(needle)
   );
 
-  // Delete the branch (best-effort)
-  try {
-    await octokit.rest.git.deleteRef({
+  for (const pr of matchingPRs) {
+    await octokit.rest.pulls.update({
       owner: params.owner,
       repo: params.repo,
-      ref: `heads/${branchName}`,
+      pull_number: pr.number,
+      state: "closed",
     });
-    console.log(`[github] Deleted branch '${branchName}'`);
-  } catch (deleteError) {
-    console.warn(
-      `[github] Failed to delete branch '${branchName}':`,
-      deleteError
+    console.log(
+      `[github] Closed PR #${pr.number} for ${params.issueKey} (issue Cancelled)`
     );
   }
 
-  return { closed: true, prNumber: pr.number, reason: "closed" };
+  // Delete every branch (open + orphan) that contains the issue key in its name.
+  // Skip the default branch as a safety net.
+  const defaultBranch = await getDefaultBranch(params.owner, params.repo);
+  const { data: branches } = await octokit.rest.repos.listBranches({
+    owner: params.owner,
+    repo: params.repo,
+    per_page: 100,
+  });
+  const matchingBranches = branches.filter(
+    (b) => b.name.toLowerCase().includes(needle) && b.name !== defaultBranch
+  );
+
+  for (const b of matchingBranches) {
+    try {
+      await octokit.rest.git.deleteRef({
+        owner: params.owner,
+        repo: params.repo,
+        ref: `heads/${b.name}`,
+      });
+      console.log(`[github] Deleted branch '${b.name}'`);
+    } catch (deleteError) {
+      console.warn(
+        `[github] Failed to delete branch '${b.name}':`,
+        deleteError
+      );
+    }
+  }
+
+  if (matchingPRs.length === 0 && matchingBranches.length === 0) {
+    return { closed: false, reason: "no_pr" };
+  }
+
+  return {
+    closed: matchingPRs.length > 0,
+    prNumber: matchingPRs[0]?.number,
+    reason: matchingPRs.length > 0 ? "closed" : "no_pr",
+  };
 }
 
 // ─── Helpers ────────────────────────────────────────────────

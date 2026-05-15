@@ -5,6 +5,7 @@ import { DEVELOPER_POOL, ORCHESTRATOR_CONFIG, type DeveloperAgent } from "./conf
 import {
   getTodoIssues,
   areBlockersResolved,
+  hasUnfinishedChildren,
   moveIssueToStatus,
   addLabelToIssue,
   addIssueComment,
@@ -120,6 +121,16 @@ async function getTodoIssuesReady(): Promise<Issue[]> {
 
   for (const issue of todoIssues) {
     try {
+      // Skip parent wrappers — issues with sub-issues should be progressed via
+      // their children, not dispatched to a developer (which produces zombie
+      // PRs since the parent has no real implementation work of its own).
+      if (await hasUnfinishedChildren(issue)) {
+        console.log(
+          `[orchestrator] ${issue.identifier} is a parent with unfinished children — skipping dispatch`
+        );
+        continue;
+      }
+
       const { resolved, pendingBlockers } = await areBlockersResolved(issue);
       if (resolved) {
         readyIssues.push(issue);
