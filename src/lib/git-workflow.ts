@@ -22,6 +22,14 @@ interface GitWorkflowInput {
   issueDescription?: string;
   teamKey?: string;
   labels?: string[];
+  /**
+   * Set true when a triggerAgent call runs in parallel on the same event
+   * row (Test transition runs `create-pr` + `scout` together). In that
+   * case the agent owns the row's status/triggeredAgent/errorMessage
+   * lifecycle — git-workflow must not write to those fields or it races
+   * the agent. Git output is logged only.
+   */
+  concurrentWithAgent?: boolean;
 }
 
 /**
@@ -33,18 +41,23 @@ export async function executeGitAction(
 ): Promise<void> {
   const { owner } = getGitHubConfig();
   const repo = getRepoForTeam(input.teamKey);
+  const skipRowUpdates = input.concurrentWithAgent === true;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Update event to PROCESSING
-      await prisma.webhookEvent.update({
-        where: { id: input.eventId },
-        data: {
-          status: WebhookEventStatus.PROCESSING,
-          triggeredAgent: `git:${input.action}`,
-          retryCount: attempt,
-        },
-      });
+      // Update event to PROCESSING — but only when we own the row.
+      // When triggerAgent runs in parallel for the same eventId, it owns
+      // status/triggeredAgent and this update would race its writes.
+      if (!skipRowUpdates) {
+        await prisma.webhookEvent.update({
+          where: { id: input.eventId },
+          data: {
+            status: WebhookEventStatus.PROCESSING,
+            triggeredAgent: `git:${input.action}`,
+            retryCount: attempt,
+          },
+        });
+      }
 
       let resultMessage: string;
 
@@ -124,20 +137,20 @@ export async function executeGitAction(
           resultMessage = `Unknown git action: ${input.action}`;
       }
 
-      // Mark as completed.
-      // IMPORTANT: do NOT write to agentSessionId here — it's reserved for the
-      // Anthropic session ID set by triggerAgent. When a route triggers both a
-      // git action and an agent (e.g. Test: create-pr + scout), git-workflow
-      // and agent-trigger may run on the same event row. Writing the git
-      // result message here would clobber the session ID stored by triggerAgent,
-      // making the cron poller unable to detect agent completion.
-      await prisma.webhookEvent.update({
-        where: { id: input.eventId },
-        data: {
-          status: WebhookEventStatus.COMPLETED,
-          processedAt: new Date(),
-        },
-      });
+      // Mark as completed — only when we own the row. When an agent is also
+      // running on this event (Test: create-pr + scout), the agent's
+      // lifecycle owns status/processedAt; writing COMPLETED here races
+      // triggerAgent's writes and can make the event look finished before
+      // the agent has even started.
+      if (!skipRowUpdates) {
+        await prisma.webhookEvent.update({
+          where: { id: input.eventId },
+          data: {
+            status: WebhookEventStatus.COMPLETED,
+            processedAt: new Date(),
+          },
+        });
+      }
 
       console.log(
         `[git-workflow] ${input.action} completed for ${input.issueKey}: ${resultMessage}`
@@ -159,15 +172,21 @@ export async function executeGitAction(
       }
 
       if (isLastAttempt) {
-        await prisma.webhookEvent.update({
-          where: { id: input.eventId },
-          data: {
-            status: WebhookEventStatus.FAILED,
-            errorMessage: `All retries exhausted: ${errorMessage}`,
-            retryCount: attempt,
-            processedAt: new Date(),
-          },
-        });
+        // Only write FAILED when we own the row. When the agent is also
+        // running, leave the row to the agent's lifecycle — the git error
+        // is logged above, and posting a Linear comment about a failed
+        // create-pr is handled separately if needed.
+        if (!skipRowUpdates) {
+          await prisma.webhookEvent.update({
+            where: { id: input.eventId },
+            data: {
+              status: WebhookEventStatus.FAILED,
+              errorMessage: `All retries exhausted: ${errorMessage}`,
+              retryCount: attempt,
+              processedAt: new Date(),
+            },
+          });
+        }
         return;
       }
 

@@ -163,6 +163,12 @@ export async function POST(request: NextRequest) {
         issueDescription: payload.data.description,
         teamKey: payload.data.team?.key,
         labels: payload.data.labels?.map((l) => l.name),
+        // When the route also fires an agent (Test = create-pr + scout),
+        // the agent owns the event row's status/triggeredAgent lifecycle.
+        // Telling git-workflow to skip its row updates prevents the race
+        // where git's writes clobber the agent's session-ID tracking and
+        // leave the row COMPLETED before Scout has even been triggered.
+        concurrentWithAgent: !!route.agent,
       }).catch((error) => {
         console.error(
           `[webhook] Git action '${route.gitAction}' failed for ${payload.data.identifier}:`,
