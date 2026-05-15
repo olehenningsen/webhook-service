@@ -8,6 +8,7 @@ import { triggerAgent } from "@/lib/agent-trigger";
 import { executeGitAction } from "@/lib/git-workflow";
 import { dispatchAvailableWork } from "@/lib/orchestrator";
 import { progressParentIfChildrenComplete } from "@/lib/linear-client";
+import { DEVELOPER_POOL } from "@/lib/config";
 import {
   LinearWebhookPayloadSchema,
   isStatusChange,
@@ -97,6 +98,68 @@ export async function POST(request: NextRequest) {
         processedAt: new Date(),
       },
     });
+
+    // Bug-fix re-dispatch: when Scout moves an issue Test → In Progress
+    // because she found bugs, the orchestrator does not re-trigger the
+    // dev (Todo→InProgress is its only dispatch path). Without help, the
+    // dev's session is over and the issue stays in In Progress until
+    // manual intervention.
+    //
+    // Heuristic: if the issue is back in "In Progress" and has a sticky
+    // `dev:<id>` label pointing at a developer-pool agent, and no agent
+    // session is currently running on this issue, re-trigger the labelled
+    // developer to address Scout's feedback. The first In Progress
+    // transition (from orchestrator's own moveIssueToStatus) is covered
+    // by the isAgentRunning check — orchestrator creates a PROCESSING
+    // reservation event before moving the issue, so the gate is true at
+    // that moment and we skip.
+    if (toStatus === "In Progress") {
+      try {
+        const devLabel = payload.data.labels
+          ?.map((l) => l.name)
+          .find(
+            (n) =>
+              n.startsWith("dev:") &&
+              (DEVELOPER_POOL as readonly string[]).includes(n.slice(4))
+          );
+        const dev = devLabel?.slice(4);
+        if (dev && !(await isAgentRunning(payload.data.identifier))) {
+          console.log(
+            `[webhook] Re-dispatching ${dev} for ${payload.data.identifier} (Test → In Progress bug-fix loop)`
+          );
+          // Create a fresh event row so the agent lifecycle tracks cleanly.
+          const redispatchEvent = await prisma.webhookEvent.create({
+            data: {
+              linearEventId: `redispatch-${Date.now()}-${payload.data.identifier}-${dev}`,
+              issueId: payload.data.identifier,
+              issueTitle: payload.data.title,
+              fromStatus: null,
+              toStatus: "In Progress",
+              status: WebhookEventStatus.RECEIVED,
+            },
+          });
+          triggerAgent({
+            eventId: redispatchEvent.id,
+            agent: dev,
+            issueId: payload.data.identifier,
+            issueTitle: payload.data.title,
+            issueDescription: payload.data.description,
+            toStatus: "In Progress",
+          }).catch((error) => {
+            console.error(
+              `[webhook] Re-dispatch trigger failed for ${payload.data.identifier}:`,
+              error
+            );
+          });
+        }
+      } catch (error) {
+        console.error(
+          `[webhook] Bug-fix re-dispatch check failed for ${payload.data.identifier}:`,
+          error
+        );
+      }
+    }
+
     return NextResponse.json({ received: true, eventId: event.id });
   }
 
