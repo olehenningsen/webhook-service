@@ -173,6 +173,27 @@ export async function getSessionStatus(
   return apiRequest<SessionResponse>("GET", `/v1/sessions/${sessionId}`);
 }
 
+interface SessionListResponse {
+  data: SessionResponse[];
+}
+
+/**
+ * List recent sessions for an agent. Used by triggerAgent's orphan-recovery
+ * path: when createSession aborts (Anthropic provisioning >50s), the session
+ * is often created server-side after our fetch gave up. We look it up here
+ * by title to reclaim it instead of creating yet another orphan on retry.
+ */
+export async function listAgentSessions(
+  agentId: string,
+  limit = 10
+): Promise<SessionResponse[]> {
+  const res = await apiRequest<SessionListResponse>(
+    "GET",
+    `/v1/sessions?agent_id=${encodeURIComponent(agentId)}&limit=${limit}`
+  );
+  return res.data ?? [];
+}
+
 // ─── Agents (used by setup script) ─────────────────────────
 
 export interface CreateAgentInput {

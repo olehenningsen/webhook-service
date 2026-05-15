@@ -7,6 +7,7 @@ import {
 } from "./config";
 import {
   createSession,
+  listAgentSessions,
   sendEvent,
   type SessionResource,
 } from "./managed-agents";
@@ -71,6 +72,14 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
   // *new* Anthropic session, so we keep this loop narrow. Status reset
   // to PROCESSING and errorMessage cleared on every attempt so prior
   // cron orphan-FAILED messages don't stick around if we recover here.
+  //
+  // Orphan-recovery: when createSession aborts (Anthropic provisioning
+  // exceeds our timeout), Anthropic still creates the session server-side
+  // a moment later — our fetch just never reads the response. Without
+  // recovery, each retry creates yet another orphan. After an abort, we
+  // check the agent's recent sessions for one matching our title and
+  // reclaim it instead of looping into more orphans.
+  const sessionTitle = `${input.issueId}: ${input.issueTitle}`;
   let session: { id: string } | null = null;
   let createError: unknown = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -89,7 +98,7 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
       session = await createSession(
         agentId,
         environmentId,
-        `${input.issueId}: ${input.issueTitle}`,
+        sessionTitle,
         vaultIds,
         resources
       );
@@ -105,9 +114,44 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
     } catch (error) {
       createError = error;
       const errMsg = error instanceof Error ? error.message : String(error);
+      const isAbort =
+        error instanceof Error &&
+        (error.name === "TimeoutError" || error.name === "AbortError");
       console.error(
-        `[agent-trigger] createSession attempt ${attempt + 1}/${MAX_RETRIES + 1} failed for ${input.issueId}: ${errMsg}`
+        `[agent-trigger] createSession attempt ${attempt + 1}/${MAX_RETRIES + 1} failed for ${input.issueId}: ${errMsg}${isAbort ? " (abort — probing for orphan)" : ""}`
       );
+
+      // After an abort, Anthropic may have created the session anyway.
+      // Look it up by title before retrying — saves multiplying orphans.
+      if (isAbort) {
+        try {
+          const recent = await listAgentSessions(agentId, 10);
+          const orphan = recent.find(
+            (s) =>
+              s.title === sessionTitle &&
+              // Restrict to sessions created in the last 5 minutes so we
+              // don't grab a stale match from an earlier failed run.
+              Date.now() - new Date(s.created_at).getTime() < 5 * 60 * 1000
+          );
+          if (orphan) {
+            console.log(
+              `[agent-trigger] Reclaimed orphan session ${orphan.id} for ${input.issueId} (created ${orphan.created_at})`
+            );
+            session = { id: orphan.id };
+            await prisma.webhookEvent.update({
+              where: { id: input.eventId },
+              data: { agentSessionId: orphan.id },
+            });
+            break;
+          }
+        } catch (lookupError) {
+          console.warn(
+            `[agent-trigger] Orphan-recovery lookup failed for ${input.issueId}:`,
+            lookupError
+          );
+        }
+      }
+
       if (attempt === MAX_RETRIES) break;
       await new Promise((resolve) => setTimeout(resolve, BASE_DELAY_MS * Math.pow(2, attempt)));
     }
