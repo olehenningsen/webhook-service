@@ -72,6 +72,15 @@ export async function enqueue(eventId: string, issueId: string): Promise<void> {
 
 /**
  * Dequeue the next event for an issue — returns the event to process, or null.
+ *
+ * The claim is atomic: `updateMany` with `status: QUEUED` in the WHERE clause
+ * means concurrent callers race on the same row in Postgres, and only one
+ * update returns `count: 1`. The losers see `count: 0` and bail out by
+ * returning null, so the same queued event can never be dispatched twice
+ * (which would create duplicate agent sessions). Without this, two
+ * concurrent cron invocations could both `findFirst` the same QUEUED row,
+ * both call `update` (idempotent QUEUED → RECEIVED), and both fire
+ * triggerAgent.
  */
 export async function dequeue(
   issueId: string
@@ -86,13 +95,21 @@ export async function dequeue(
 
   if (!next) return null;
 
-  await prisma.webhookEvent.update({
-    where: { id: next.id },
+  const claim = await prisma.webhookEvent.updateMany({
+    where: {
+      id: next.id,
+      status: WebhookEventStatus.QUEUED,
+    },
     data: {
       status: WebhookEventStatus.RECEIVED,
       queuePosition: null,
     },
   });
+
+  if (claim.count === 0) {
+    // Another worker won the race and already claimed this event.
+    return null;
+  }
 
   return {
     id: next.id,
