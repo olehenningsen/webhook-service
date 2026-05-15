@@ -7,6 +7,7 @@ import { isAgentRunning, enqueue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
 import { executeGitAction } from "@/lib/git-workflow";
 import { dispatchAvailableWork } from "@/lib/orchestrator";
+import { progressParentIfChildrenComplete } from "@/lib/linear-client";
 import {
   LinearWebhookPayloadSchema,
   isStatusChange,
@@ -211,7 +212,29 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // 13. If issue moved to Done, re-evaluate orchestrator (blocker may have resolved)
+  // 13. If issue moved to a terminal state, auto-progress its parent (if any)
+  // when all sibling children are also terminal. Parent issues are deliberately
+  // skipped by the orchestrator's dispatcher (no implementation work of their
+  // own), so without this step they would stay in Todo forever once their
+  // children finished. Cascading: moving the parent fires its own webhook
+  // which re-enters this handler and can progress a grandparent.
+  if (toStatus === "Done" || toStatus === "Canceled" || toStatus === "Duplicate") {
+    try {
+      const result = await progressParentIfChildrenComplete(payload.data.identifier);
+      if (result.moved) {
+        console.log(
+          `[webhook] Auto-progressed parent ${result.parent} → Done after ${payload.data.identifier} reached ${toStatus}`
+        );
+      }
+    } catch (error) {
+      console.error(
+        `[webhook] Parent auto-progress failed for ${payload.data.identifier}:`,
+        error
+      );
+    }
+  }
+
+  // 14. If issue moved to Done, re-evaluate orchestrator (blocker may have resolved)
   if (toStatus === "Done") {
     try {
       await dispatchAvailableWork();

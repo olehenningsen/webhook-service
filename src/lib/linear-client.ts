@@ -62,19 +62,67 @@ export async function getTodoIssues(teamKey: string): Promise<Issue[]> {
 }
 
 /**
- * Check if an issue is a "parent wrapper" — has child issues that aren't all Done.
- * Parent issues should NOT be dispatched to developers, since their actual
- * implementation work lives in the sub-issues. Returns true if the issue has
- * any children and at least one is not Done.
+ * Check if an issue is a "parent wrapper" — has child issues that aren't yet
+ * in a terminal state. Parent issues should NOT be dispatched to developers,
+ * since their actual implementation work lives in the sub-issues. Returns
+ * true if the issue has any children and at least one is still in flight
+ * (i.e., not in a `completed` or `canceled` Linear state type).
+ *
+ * Terminal states in Linear's classification: `completed` (Done) and
+ * `canceled` (Canceled, Duplicate). Any other type means work could
+ * still happen there.
  */
 export async function hasUnfinishedChildren(issue: Issue): Promise<boolean> {
   const children = await issue.children();
   if (children.nodes.length === 0) return false;
   for (const child of children.nodes) {
     const state = await child.state;
-    if (!state || state.name !== "Done") return true;
+    if (!state) return true;
+    if (state.type !== "completed" && state.type !== "canceled") return true;
   }
   return false;
+}
+
+/**
+ * If the given issue has a parent whose remaining children are all in a
+ * terminal state (completed or canceled), move the parent to Done.
+ *
+ * Parents are intentionally never dispatched to developers (their work
+ * lives in sub-issues), so without this step they would sit in Todo
+ * forever once their children finished. Called from the webhook handler
+ * when a child transitions to a terminal state.
+ *
+ * Cascading: moving the parent to Done fires a new Linear webhook for
+ * the parent's own state change, which will reach this function again
+ * and walk further up the tree if necessary. No in-process recursion.
+ */
+export async function progressParentIfChildrenComplete(
+  issueIdentifier: string
+): Promise<{ moved: boolean; parent?: string }> {
+  const client = getLinearClient();
+  const issue = await client.issue(issueIdentifier);
+  const parent = await issue.parent;
+  if (!parent) return { moved: false };
+
+  const parentState = await parent.state;
+  if (!parentState) return { moved: false };
+  // Already in a terminal state — nothing to do.
+  if (parentState.type === "completed" || parentState.type === "canceled") {
+    return { moved: false };
+  }
+
+  if (await hasUnfinishedChildren(parent)) {
+    return { moved: false };
+  }
+
+  const team = await parent.team;
+  if (!team) return { moved: false };
+
+  await moveIssueToStatus(parent.id, team.key, "Done");
+  console.log(
+    `[linear-client] Auto-progressed parent ${parent.identifier} → Done (all children terminal, triggered by ${issueIdentifier})`
+  );
+  return { moved: true, parent: parent.identifier };
 }
 
 /**
