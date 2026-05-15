@@ -48,45 +48,45 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
   const fallbackToken = resources[0]?.authorization_token;
   const userMessage = buildUserMessage(input, repoMount, repoUrl, fallbackToken);
 
+  // For Saga/Atlas/Scout, add a dev:<agent> label up-front so the dashboard
+  // sees them as active. Developer-pool agents get this from the
+  // orchestrator. Best-effort — failures are non-fatal.
+  const isDeveloper = (DEVELOPER_POOL as readonly string[]).includes(input.agent);
+  if (!isDeveloper) {
+    try {
+      await addLabelByIssueKey(
+        input.issueId,
+        `dev:${input.agent}`,
+        NON_DEV_LABEL_COLORS[input.agent]
+      );
+    } catch (labelError) {
+      console.warn(
+        `[agent-trigger] Failed to add dev:${input.agent} label to ${input.issueId}:`,
+        labelError
+      );
+    }
+  }
+
+  // Phase 1: create the session, with retries. Each attempt creates a
+  // *new* Anthropic session, so we keep this loop narrow. Status reset
+  // to PROCESSING and errorMessage cleared on every attempt so prior
+  // cron orphan-FAILED messages don't stick around if we recover here.
+  let session: { id: string } | null = null;
+  let createError: unknown = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Update event to PROCESSING
       await prisma.webhookEvent.update({
         where: { id: input.eventId },
         data: {
           status: WebhookEventStatus.PROCESSING,
           triggeredAgent: input.agent,
           retryCount: attempt,
+          errorMessage: null,
         },
       });
 
-      // For Saga/Atlas/Scout, add a dev:<agent> label so the dashboard sees
-      // them as active on this issue. Developer-pool agents (Pixel, Sprite,
-      // Byte, Loop) already get this label from the orchestrator when it
-      // dispatches them; this branch covers the agents that get triggered
-      // directly by status changes (Refinement → Saga, Specification → Atlas,
-      // Test → Scout). Best-effort — failures are non-fatal.
-      const isDeveloper = (DEVELOPER_POOL as readonly string[]).includes(input.agent);
-      if (!isDeveloper && attempt === 0) {
-        try {
-          await addLabelByIssueKey(
-            input.issueId,
-            `dev:${input.agent}`,
-            NON_DEV_LABEL_COLORS[input.agent]
-          );
-        } catch (labelError) {
-          console.warn(
-            `[agent-trigger] Failed to add dev:${input.agent} label to ${input.issueId}:`,
-            labelError
-          );
-        }
-      }
-
-      // Create a managed agent session with vault credentials (MCP OAuth)
-      // and a github_repository resource (auth baked into git remote — agent
-      // can `git push` without ever handling the token).
-      console.log(`[agent-trigger] Creating session for ${input.issueId} (agent: ${agentId}, env: ${environmentId}, vaults: ${vaultIds.join(",")}, resources: ${resources.length})`);
-      const session = await createSession(
+      console.log(`[agent-trigger] Creating session for ${input.issueId} (attempt ${attempt + 1}/${MAX_RETRIES + 1}, agent: ${agentId}, env: ${environmentId}, vaults: ${vaultIds.join(",")}, resources: ${resources.length})`);
+      session = await createSession(
         agentId,
         environmentId,
         `${input.issueId}: ${input.issueTitle}`,
@@ -95,55 +95,69 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
       );
       console.log(`[agent-trigger] Session created: ${session.id}`);
 
-      // Persist agentSessionId BEFORE sendEvent. If sendEvent throws (Vercel
-      // runtime cut-off, hanging fetch, transient API error), the session
-      // still exists in Anthropic with 0 events — the cron poller's
-      // empty-session recovery (poll-sessions/route.ts) catches both
-      // `running` and `idle` empty sessions and resends the initial message.
-      // Without persisting the ID first, an aborted sendEvent leaves the
-      // session orphaned in Anthropic with no way for cron to find it, and
-      // the work is silently dropped until manual intervention.
+      // Persist agentSessionId immediately so the cron empty-session
+      // recovery can find this session if anything fails from here on.
       await prisma.webhookEvent.update({
         where: { id: input.eventId },
-        data: {
-          agentSessionId: session.id,
-        },
+        data: { agentSessionId: session.id },
       });
-
-      console.log(`[agent-trigger] Sending initial message to ${session.id}`);
-      await sendEvent(session.id, userMessage);
-      console.log(`[agent-trigger] Message sent to ${session.id}`);
-
-      return session.id;
+      break;
     } catch (error) {
-      const isLastAttempt = attempt === MAX_RETRIES;
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-
+      createError = error;
+      const errMsg = error instanceof Error ? error.message : String(error);
       console.error(
-        `[agent-trigger] Attempt ${attempt + 1}/${MAX_RETRIES + 1} failed for ${input.issueId}: ${errorMessage}`
+        `[agent-trigger] createSession attempt ${attempt + 1}/${MAX_RETRIES + 1} failed for ${input.issueId}: ${errMsg}`
       );
-
-      if (isLastAttempt) {
-        await prisma.webhookEvent.update({
-          where: { id: input.eventId },
-          data: {
-            status: WebhookEventStatus.FAILED,
-            errorMessage: `All retries exhausted: ${errorMessage}`,
-            retryCount: attempt,
-            processedAt: new Date(),
-          },
-        });
-        return null;
-      }
-
-      // Exponential backoff
-      const delay = BASE_DELAY_MS * Math.pow(2, attempt);
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (attempt === MAX_RETRIES) break;
+      await new Promise((resolve) => setTimeout(resolve, BASE_DELAY_MS * Math.pow(2, attempt)));
     }
   }
 
-  return null;
+  if (!session) {
+    const errMsg = createError instanceof Error ? createError.message : String(createError);
+    await prisma.webhookEvent.update({
+      where: { id: input.eventId },
+      data: {
+        status: WebhookEventStatus.FAILED,
+        errorMessage: `createSession exhausted: ${errMsg}`,
+        processedAt: new Date(),
+      },
+    });
+    return null;
+  }
+
+  // Phase 2: deliver the initial message on the EXISTING session. Retrying
+  // sendEvent here instead of in the outer loop avoids creating a new
+  // Anthropic session per attempt (previously this leaked up to MAX_RETRIES+1
+  // orphan sessions per sendEvent-timeout cycle).
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[agent-trigger] Sending initial message to ${session.id} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
+      await sendEvent(session.id, userMessage);
+      console.log(`[agent-trigger] Message sent to ${session.id}`);
+      return session.id;
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[agent-trigger] sendEvent attempt ${attempt + 1}/${MAX_RETRIES + 1} failed for ${input.issueId} on session ${session.id}: ${errMsg}`
+      );
+      if (attempt === MAX_RETRIES) {
+        // sendEvent never delivered, but the session is alive and known to
+        // the DB. Leave status PROCESSING so cron empty-session recovery
+        // can wake it up with a fresh message. Record what happened.
+        await prisma.webhookEvent.update({
+          where: { id: input.eventId },
+          data: {
+            errorMessage: `sendEvent exhausted (cron will recover): ${errMsg}`,
+          },
+        });
+        return session.id;
+      }
+      await new Promise((resolve) => setTimeout(resolve, BASE_DELAY_MS * Math.pow(2, attempt)));
+    }
+  }
+
+  return session.id;
 }
 
 /**
