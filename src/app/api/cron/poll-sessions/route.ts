@@ -117,7 +117,12 @@ export async function GET(request: NextRequest) {
       // sits in Anthropic with 0 events and never starts work. Resend a
       // minimal wake-up message that tells the agent to fetch the issue
       // and proceed per its SKILL.md.
-      if (session.status === "running") {
+      //
+      // Covers both `running` (session provisioned, still ticking) and
+      // `idle` (session provisioned but never received an event so it
+      // settled back to idle). The idle case previously fell through to
+      // the COMPLETED branch below and silently dropped the work.
+      if (session.status === "running" || session.status === "idle") {
         try {
           const events = await listSessionEvents(event.agentSessionId!, 3);
           const sessionElapsed = Date.now() - event.createdAt.getTime();
@@ -130,7 +135,7 @@ export async function GET(request: NextRequest) {
               `(Genaktivering: din session blev oprettet uden initial besked.)`;
             await sendEvent(event.agentSessionId!, wakeup);
             console.log(
-              `[poll-sessions] Recovered empty session ${event.agentSessionId} for ${event.issueId}`
+              `[poll-sessions] Recovered empty session ${event.agentSessionId} (${session.status}) for ${event.issueId}`
             );
             results.push({
               eventId: event.id,
