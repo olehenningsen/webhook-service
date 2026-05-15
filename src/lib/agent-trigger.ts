@@ -138,9 +138,18 @@ export async function triggerAgent(input: TriggerInput): Promise<string | null> 
               `[agent-trigger] Reclaimed orphan session ${orphan.id} for ${input.issueId} (created ${orphan.created_at})`
             );
             session = { id: orphan.id };
+            // Reset status to PROCESSING and clear errorMessage in case the
+            // cron orphan-FAILED branch already ran on this row while we
+            // were waiting for Anthropic. The session is actually fine —
+            // the row should reflect that.
             await prisma.webhookEvent.update({
               where: { id: input.eventId },
-              data: { agentSessionId: orphan.id },
+              data: {
+                status: WebhookEventStatus.PROCESSING,
+                agentSessionId: orphan.id,
+                errorMessage: null,
+                processedAt: null,
+              },
             });
             break;
           }
