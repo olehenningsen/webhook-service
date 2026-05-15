@@ -46,12 +46,21 @@ function getHeaders(): Record<string, string> {
   };
 }
 
-const REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
+// createSession provisions a sandbox (vault auth, github_repository mount,
+// MCP server setup). Under load the server-side work can exceed 30s even
+// though the typical case is 1-5s. Each retry on AbortError leaks an
+// orphan session in Anthropic (provisioning runs to completion regardless
+// of our fetch abort), so we give createSession a longer budget. Capped
+// well below Vercel function maxDuration (60s) so the outer handler can
+// still mark FAILED cleanly.
+const CREATE_SESSION_TIMEOUT_MS = 50_000;
 
 async function apiRequest<T>(
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
 ): Promise<T> {
   const url = `${BASE_URL}${path}`;
   const options: RequestInit = {
@@ -60,7 +69,7 @@ async function apiRequest<T>(
     // Bound every request — without this, a hanging fetch silently dies
     // when Vercel kills the function runtime, leaving orphan sessions
     // (e.g. session created but initial sendEvent never delivered).
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   };
 
   if (body) {
@@ -123,13 +132,18 @@ export async function createSession(
   vaultIds?: string[],
   resources?: SessionResource[]
 ): Promise<SessionResponse> {
-  return apiRequest<SessionResponse>("POST", "/v1/sessions", {
-    agent: agentId,
-    environment_id: environmentId,
-    ...(title && { title }),
-    ...(vaultIds?.length && { vault_ids: vaultIds }),
-    ...(resources?.length && { resources }),
-  });
+  return apiRequest<SessionResponse>(
+    "POST",
+    "/v1/sessions",
+    {
+      agent: agentId,
+      environment_id: environmentId,
+      ...(title && { title }),
+      ...(vaultIds?.length && { vault_ids: vaultIds }),
+      ...(resources?.length && { resources }),
+    },
+    CREATE_SESSION_TIMEOUT_MS
+  );
 }
 
 /**
