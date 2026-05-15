@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { WebhookEventStatus } from "@/generated/prisma/enums";
-import { getSessionStatus } from "@/lib/managed-agents";
+import { getSessionStatus, listSessionEvents, sendEvent } from "@/lib/managed-agents";
 import { dequeue } from "@/lib/queue";
 import { triggerAgent } from "@/lib/agent-trigger";
 import { executeGitAction } from "@/lib/git-workflow";
@@ -111,6 +111,42 @@ export async function GET(request: NextRequest) {
 
       // Query session status from managed agents API
       const session = await getSessionStatus(event.agentSessionId!);
+
+      // RECOVERY: detect "empty session" — agent-trigger stored a session ID
+      // but the initial sendEvent didn't actually deliver, so the session
+      // sits in Anthropic with 0 events and never starts work. Resend a
+      // minimal wake-up message that tells the agent to fetch the issue
+      // and proceed per its SKILL.md.
+      if (session.status === "running") {
+        try {
+          const events = await listSessionEvents(event.agentSessionId!, 3);
+          const sessionElapsed = Date.now() - event.createdAt.getTime();
+          if (events.length === 0 && sessionElapsed > 60_000) {
+            const wakeup =
+              `## Issue: ${event.issueId} — ${event.issueTitle}\n\n` +
+              `**Status:** ${event.fromStatus ?? "(ny)"} → ${event.toStatus}\n\n` +
+              `Hent issue-detaljerne via Linear MCP (\`get_issue("${event.issueId}")\`) ` +
+              `og udfør din rolle som beskrevet i din SKILL.md. ` +
+              `(Genaktivering: din session blev oprettet uden initial besked.)`;
+            await sendEvent(event.agentSessionId!, wakeup);
+            console.log(
+              `[poll-sessions] Recovered empty session ${event.agentSessionId} for ${event.issueId}`
+            );
+            results.push({
+              eventId: event.id,
+              issueId: event.issueId,
+              sessionStatus: "recovered",
+              action: "WAKE_UP",
+            });
+            continue;
+          }
+        } catch (recoveryError) {
+          console.warn(
+            `[poll-sessions] Empty-session recovery check failed for ${event.issueId}:`,
+            recoveryError
+          );
+        }
+      }
 
       if (session.status === "idle") {
         // Agent finished — mark completed
