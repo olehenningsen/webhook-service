@@ -54,13 +54,19 @@ export async function GET(request: NextRequest) {
   // the session at all). PR #12's FAILED-recovery doesn't help here because
   // there's no session to wake up. Observed 2026-05-16 on TEA-110 Scout
   // and TEA-97 Atlas: manual triggerAgent rescue was the only path.
-  // Scope: last 30 min, no session ID, has an agent, retried < 2 times.
+  //
+  // The `linearEventId NOT startsWith "auto-retry-"` filter is critical:
+  // agent-trigger.ts overwrites retryCount on every createSession attempt
+  // (line 92), so the retryCount field can't be used to cap auto-retries.
+  // Instead we only auto-retry rows that aren't themselves auto-retries —
+  // each original FAILED row gets at most 1 auto-retry, never more.
+  // Scope: last 30 min, no session ID, has an agent, not already an auto-retry.
   const autoRetryCandidates = await prisma.webhookEvent.findMany({
     where: {
       status: WebhookEventStatus.FAILED,
       agentSessionId: null,
       triggeredAgent: { not: null },
-      retryCount: { lt: 2 },
+      linearEventId: { not: { startsWith: "auto-retry-" } },
       createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
       errorMessage: { contains: "Agent session was never created" },
     },
