@@ -219,13 +219,21 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      // An `idle` status without `ended_at` means the session paused between
-      // tool calls — NOT that it finished. Marking COMPLETED here loses
-      // tracking of agents that are still working (observed 2026-05-16 on
-      // TEA-103 Atlas: row went COMPLETED while Anthropic session was running
-      // through 97 more events). Only treat as completed when Anthropic
-      // explicitly says the session ended.
-      if (session.status === "idle" && session.ended_at) {
+      // `idle` is the only signal Anthropic gives for "agent done with work"
+      // on a non-terminated session — `ended_at` is set only when a session
+      // is forcefully terminated, not when the agent finishes normally.
+      //
+      // KNOWN FALSE-POSITIVE: long-running agents that pause between tool
+      // calls briefly show `idle`. If cron checks during that gap we mark
+      // the row COMPLETED while the agent is still working (observed
+      // 2026-05-16 on TEA-103 Atlas: row went COMPLETED while session
+      // continued through 97 more events). The cost of this is loss of
+      // tracking, not loss of work — the agent still finishes the task and
+      // updates Linear. Accepting it for now because the alternative
+      // (requiring ended_at) blocks the entire pipeline on every agent run
+      // since Anthropic never sets ended_at for normal completion. A proper
+      // fix needs polling-state tracking (idle across N consecutive polls).
+      if (session.status === "idle") {
         await prisma.webhookEvent.update({
           where: { id: event.id },
           data: {
