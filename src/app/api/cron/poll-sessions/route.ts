@@ -8,6 +8,18 @@ import { executeGitAction } from "@/lib/git-workflow";
 import { routeStatus } from "@/lib/router";
 import { dispatchAvailableWork } from "@/lib/orchestrator";
 import { DEVELOPER_POOL } from "@/lib/config";
+import { getLinearClient } from "@/lib/linear-client";
+
+// States where an agent is expected to progress the issue forward. If a row
+// is marked COMPLETED but the Linear state STILL matches the trigger state
+// after a generous wait, the agent stalled silently (e.g. session.error
+// abandonment storm observed 2026-05-16 on TEA-100 Atlas).
+const AGENT_ACTION_STATES = new Set([
+  "Refinement",
+  "Specification",
+  "In Progress",
+  "Test",
+]);
 
 const AGENT_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
@@ -72,6 +84,31 @@ export async function GET(request: NextRequest) {
     },
   });
 
+  // Stalled-COMPLETED candidates: rows the cron marked COMPLETED on Anthropic
+  // `idle` status, but where the agent never moved the Linear issue onward to
+  // the next state. Happens when an agent session hits a session.error storm
+  // and Anthropic auto-reschedules forever without completing real work
+  // (observed 2026-05-16 on TEA-100 Atlas: 126 events, 125s active of 1382s
+  // duration, session never recovered, manual triggerAgent rescue needed).
+  // Scope: COMPLETED in agent-action states, processed 30+ min ago but not
+  // ancient, excluded auto-retry- and stalled-retry- prefixes to avoid loops.
+  const stalledCandidates = await prisma.webhookEvent.findMany({
+    where: {
+      status: WebhookEventStatus.COMPLETED,
+      agentSessionId: { not: null },
+      triggeredAgent: { not: null },
+      toStatus: { in: Array.from(AGENT_ACTION_STATES) },
+      processedAt: {
+        lte: new Date(Date.now() - 30 * 60 * 1000),
+        gte: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      },
+      AND: [
+        { linearEventId: { not: { startsWith: "auto-retry-" } } },
+        { linearEventId: { not: { startsWith: "stalled-retry-" } } },
+      ],
+    },
+  });
+
   const results: Array<{
     eventId: string;
     issueId: string;
@@ -82,7 +119,8 @@ export async function GET(request: NextRequest) {
   if (
     processingEvents.length === 0 &&
     failedRecoveryCandidates.length === 0 &&
-    autoRetryCandidates.length === 0
+    autoRetryCandidates.length === 0 &&
+    stalledCandidates.length === 0
   ) {
     return NextResponse.json({ polled: 0, results: [] });
   }
@@ -193,6 +231,82 @@ export async function GET(request: NextRequest) {
       console.warn(
         `[poll-sessions] Auto-retry setup failed for ${event.issueId}:`,
         retryError
+      );
+    }
+  }
+
+  // Stalled-COMPLETED recovery: for each candidate, verify with Linear that
+  // the issue truly hasn't progressed past `toStatus`. If so, the agent
+  // failed silently; spin up a fresh trigger. Linear lookup is one call per
+  // candidate, but the scope filter keeps the set small (typically 0).
+  const linearClient = getLinearClient();
+  for (const event of stalledCandidates) {
+    try {
+      // Dedup first (cheap, no API call): skip if a newer event exists for
+      // this issue+agent — means a previous tick already spawned a retry.
+      const newest = await prisma.webhookEvent.findFirst({
+        where: {
+          issueId: event.issueId,
+          triggeredAgent: event.triggeredAgent,
+        },
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+      });
+      if (newest?.id !== event.id) continue;
+
+      const issue = await linearClient.issue(event.issueId);
+      const state = await issue.state;
+      if (!state || state.name !== event.toStatus) {
+        // State progressed normally — agent did its job, false alarm.
+        continue;
+      }
+
+      const stalledEvent = await prisma.webhookEvent.create({
+        data: {
+          linearEventId: `stalled-retry-${event.id}`,
+          issueId: event.issueId,
+          issueTitle: event.issueTitle,
+          fromStatus: event.fromStatus,
+          toStatus: event.toStatus,
+          triggeredAgent: event.triggeredAgent,
+          status: WebhookEventStatus.PROCESSING,
+        },
+      });
+
+      triggerAgent({
+        eventId: stalledEvent.id,
+        agent: event.triggeredAgent!,
+        issueId: event.issueId,
+        issueTitle: event.issueTitle,
+        fromStatus: event.fromStatus ?? undefined,
+        toStatus: event.toStatus,
+      }).catch((triggerErr) => {
+        console.error(
+          `[poll-sessions] stalled-retry triggerAgent failed for ${event.issueId}:`,
+          triggerErr
+        );
+      });
+
+      await prisma.webhookEvent.update({
+        where: { id: event.id },
+        data: {
+          errorMessage: `Stalled — state still ${state.name} after agent COMPLETED [stalled-retry as ${stalledEvent.id}]`,
+        },
+      });
+
+      console.log(
+        `[poll-sessions] Stalled-retry for ${event.issueId} (${event.triggeredAgent}, state=${state.name}) as ${stalledEvent.id}`
+      );
+      results.push({
+        eventId: event.id,
+        issueId: event.issueId,
+        sessionStatus: "stalled-completed",
+        action: "STALLED_RETRY",
+      });
+    } catch (stalledErr) {
+      console.warn(
+        `[poll-sessions] Stalled-retry check failed for ${event.issueId}:`,
+        stalledErr
       );
     }
   }
@@ -405,14 +519,15 @@ export async function GET(request: NextRequest) {
   }
 
   console.log(
-    `[poll-sessions] Polled ${processingEvents.length} PROCESSING + ${failedRecoveryCandidates.length} FAILED-recovery + ${autoRetryCandidates.length} auto-retry: ${JSON.stringify(results)}`
+    `[poll-sessions] Polled ${processingEvents.length} PROCESSING + ${failedRecoveryCandidates.length} FAILED-recovery + ${autoRetryCandidates.length} auto-retry + ${stalledCandidates.length} stalled: ${JSON.stringify(results)}`
   );
 
   return NextResponse.json({
     polled:
       processingEvents.length +
       failedRecoveryCandidates.length +
-      autoRetryCandidates.length,
+      autoRetryCandidates.length +
+      stalledCandidates.length,
     results,
   });
 }
