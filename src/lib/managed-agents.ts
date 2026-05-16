@@ -11,6 +11,10 @@ interface SessionResponse {
   title: string | null;
   created_at: string;
   updated_at: string;
+  // Set when the session has finished (status went terminal). Anthropic also
+  // reports `status: "idle"` between tool calls on long-running sessions, so
+  // `idle` alone is NOT a reliable "done" signal — only `ended_at` is.
+  ended_at: string | null;
   stats?: {
     active_seconds: number;
     duration_seconds: number;

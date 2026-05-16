@@ -33,9 +33,21 @@ export async function GET(request: NextRequest) {
     },
   });
 
-  if (processingEvents.length === 0) {
-    return NextResponse.json({ polled: 0, results: [] });
-  }
+  // FAILED-recovery candidates: rows the cron previously marked FAILED via
+  // the orphan-FAILED branch, but where orphan-reclaim later back-filled a
+  // session ID (so the session does exist at Anthropic — it just never got
+  // the initial user message). Observed 2026-05-16 on TEA-107 Scout: row
+  // was FAILED with sess set, session at Anthropic had 0 events. Without
+  // this loop the only recovery was a manual API wake-up.
+  // Scope: last 30 min, has session ID, error is the orphan-FAILED message.
+  const failedRecoveryCandidates = await prisma.webhookEvent.findMany({
+    where: {
+      status: WebhookEventStatus.FAILED,
+      agentSessionId: { not: null },
+      createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
+      errorMessage: { contains: "Agent session was never created" },
+    },
+  });
 
   const results: Array<{
     eventId: string;
@@ -43,6 +55,53 @@ export async function GET(request: NextRequest) {
     sessionStatus: string;
     action: string;
   }> = [];
+
+  if (
+    processingEvents.length === 0 &&
+    failedRecoveryCandidates.length === 0
+  ) {
+    return NextResponse.json({ polled: 0, results: [] });
+  }
+
+  // Attempt to recover FAILED orphans. If the session has 0 events, send
+  // the initial wake-up and flip the row back to PROCESSING. Cron then
+  // tracks it normally on the next tick.
+  for (const event of failedRecoveryCandidates) {
+    try {
+      const evts = await listSessionEvents(event.agentSessionId!, 3);
+      if (evts.length === 0) {
+        const wakeup =
+          `## Issue: ${event.issueId} — ${event.issueTitle}\n\n` +
+          `**Status:** ${event.fromStatus ?? "(ny)"} → ${event.toStatus}\n\n` +
+          `Hent issue-detaljerne via Linear MCP (\`get_issue("${event.issueId}")\`) ` +
+          `og udfør din rolle som beskrevet i din SKILL.md. ` +
+          `(Genaktivering: din session blev markeret FAILED men eksisterer stadig hos Anthropic uden initial besked.)`;
+        await sendEvent(event.agentSessionId!, wakeup);
+        await prisma.webhookEvent.update({
+          where: { id: event.id },
+          data: {
+            status: WebhookEventStatus.PROCESSING,
+            errorMessage: null,
+            processedAt: null,
+          },
+        });
+        console.log(
+          `[poll-sessions] FAILED-orphan recovered: ${event.agentSessionId} for ${event.issueId}`
+        );
+        results.push({
+          eventId: event.id,
+          issueId: event.issueId,
+          sessionStatus: "failed-orphan",
+          action: "RECOVERED",
+        });
+      }
+    } catch (recoveryError) {
+      console.warn(
+        `[poll-sessions] FAILED-orphan recovery failed for ${event.issueId}:`,
+        recoveryError
+      );
+    }
+  }
 
   for (const event of processingEvents) {
     try {
@@ -160,8 +219,13 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      if (session.status === "idle") {
-        // Agent finished — mark completed
+      // An `idle` status without `ended_at` means the session paused between
+      // tool calls — NOT that it finished. Marking COMPLETED here loses
+      // tracking of agents that are still working (observed 2026-05-16 on
+      // TEA-103 Atlas: row went COMPLETED while Anthropic session was running
+      // through 97 more events). Only treat as completed when Anthropic
+      // explicitly says the session ended.
+      if (session.status === "idle" && session.ended_at) {
         await prisma.webhookEvent.update({
           where: { id: event.id },
           data: {
@@ -239,11 +303,11 @@ export async function GET(request: NextRequest) {
   }
 
   console.log(
-    `[poll-sessions] Polled ${processingEvents.length} sessions: ${JSON.stringify(results)}`
+    `[poll-sessions] Polled ${processingEvents.length} PROCESSING + ${failedRecoveryCandidates.length} FAILED-recovery: ${JSON.stringify(results)}`
   );
 
   return NextResponse.json({
-    polled: processingEvents.length,
+    polled: processingEvents.length + failedRecoveryCandidates.length,
     results,
   });
 }
