@@ -49,6 +49,23 @@ export async function GET(request: NextRequest) {
     },
   });
 
+  // Auto-retry candidates: FAILED rows where createSession never succeeded
+  // (sid still null after the 10-min grace period — Anthropic never created
+  // the session at all). PR #12's FAILED-recovery doesn't help here because
+  // there's no session to wake up. Observed 2026-05-16 on TEA-110 Scout
+  // and TEA-97 Atlas: manual triggerAgent rescue was the only path.
+  // Scope: last 30 min, no session ID, has an agent, retried < 2 times.
+  const autoRetryCandidates = await prisma.webhookEvent.findMany({
+    where: {
+      status: WebhookEventStatus.FAILED,
+      agentSessionId: null,
+      triggeredAgent: { not: null },
+      retryCount: { lt: 2 },
+      createdAt: { gte: new Date(Date.now() - 30 * 60 * 1000) },
+      errorMessage: { contains: "Agent session was never created" },
+    },
+  });
+
   const results: Array<{
     eventId: string;
     issueId: string;
@@ -58,7 +75,8 @@ export async function GET(request: NextRequest) {
 
   if (
     processingEvents.length === 0 &&
-    failedRecoveryCandidates.length === 0
+    failedRecoveryCandidates.length === 0 &&
+    autoRetryCandidates.length === 0
   ) {
     return NextResponse.json({ polled: 0, results: [] });
   }
@@ -99,6 +117,76 @@ export async function GET(request: NextRequest) {
       console.warn(
         `[poll-sessions] FAILED-orphan recovery failed for ${event.issueId}:`,
         recoveryError
+      );
+    }
+  }
+
+  // Auto-retry FAILED rows that never got a session ID. Create a NEW event
+  // row (so we don't mutate the original FAILED audit trail) with retryCount
+  // bumped, then fire triggerAgent. Dedupe: skip if a newer event already
+  // exists for this issue+agent — means a previous cron tick already spawned
+  // the retry. retryCount caps total tries at 3 (original + 2 auto-retries).
+  for (const event of autoRetryCandidates) {
+    try {
+      const newest = await prisma.webhookEvent.findFirst({
+        where: {
+          issueId: event.issueId,
+          triggeredAgent: event.triggeredAgent,
+        },
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+      });
+      if (newest?.id !== event.id) continue;
+
+      const nextRetry = event.retryCount + 1;
+      const retryEvent = await prisma.webhookEvent.create({
+        data: {
+          linearEventId: `auto-retry-${event.id}-${nextRetry}`,
+          issueId: event.issueId,
+          issueTitle: event.issueTitle,
+          fromStatus: event.fromStatus,
+          toStatus: event.toStatus,
+          triggeredAgent: event.triggeredAgent,
+          status: WebhookEventStatus.PROCESSING,
+          retryCount: nextRetry,
+        },
+      });
+
+      // Fire-and-forget — completion tracked normally via next cron tick.
+      triggerAgent({
+        eventId: retryEvent.id,
+        agent: event.triggeredAgent!,
+        issueId: event.issueId,
+        issueTitle: event.issueTitle,
+        fromStatus: event.fromStatus ?? undefined,
+        toStatus: event.toStatus,
+      }).catch((triggerErr) => {
+        console.error(
+          `[poll-sessions] auto-retry triggerAgent failed for ${event.issueId}:`,
+          triggerErr
+        );
+      });
+
+      await prisma.webhookEvent.update({
+        where: { id: event.id },
+        data: {
+          errorMessage: `${event.errorMessage} [auto-retry ${nextRetry} as ${retryEvent.id}]`,
+        },
+      });
+
+      console.log(
+        `[poll-sessions] Auto-retry ${nextRetry}/2 for ${event.issueId} (${event.triggeredAgent}) as ${retryEvent.id}`
+      );
+      results.push({
+        eventId: event.id,
+        issueId: event.issueId,
+        sessionStatus: "no-sid-orphan",
+        action: `AUTO_RETRY_${nextRetry}`,
+      });
+    } catch (retryError) {
+      console.warn(
+        `[poll-sessions] Auto-retry setup failed for ${event.issueId}:`,
+        retryError
       );
     }
   }
@@ -311,11 +399,14 @@ export async function GET(request: NextRequest) {
   }
 
   console.log(
-    `[poll-sessions] Polled ${processingEvents.length} PROCESSING + ${failedRecoveryCandidates.length} FAILED-recovery: ${JSON.stringify(results)}`
+    `[poll-sessions] Polled ${processingEvents.length} PROCESSING + ${failedRecoveryCandidates.length} FAILED-recovery + ${autoRetryCandidates.length} auto-retry: ${JSON.stringify(results)}`
   );
 
   return NextResponse.json({
-    polled: processingEvents.length + failedRecoveryCandidates.length,
+    polled:
+      processingEvents.length +
+      failedRecoveryCandidates.length +
+      autoRetryCandidates.length,
     results,
   });
 }
