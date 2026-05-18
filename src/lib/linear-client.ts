@@ -278,8 +278,16 @@ export async function getOrCreateLabel(
 
 /**
  * Add a label to an issue by its identifier (e.g. "TEA-67").
- * Looks up the issue, then delegates to addLabelToIssue.
- * No-op if the issue can't be found.
+ *
+ * Uses `client.issue(identifier)` for direct lookup — Linear's SDK accepts
+ * both UUID and human identifier. Previously this used `searchIssues` which
+ * relies on the search index; newly-created issues sometimes weren't in the
+ * index yet when an agent was triggered milliseconds later, causing the
+ * label add to be skipped silently. Observed 2026-05-18 on TEA-142: Atlas
+ * was triggered but `dev:atlas` label never appeared, leaving the dashboard
+ * showing Atlas as idle even while she was working.
+ *
+ * No-op if the issue can't be found by direct lookup (genuinely missing).
  */
 export async function addLabelByIssueKey(
   issueIdentifier: string,
@@ -287,15 +295,16 @@ export async function addLabelByIssueKey(
   labelColor?: string
 ): Promise<void> {
   const client = getLinearClient();
-  const results = await client.searchIssues(issueIdentifier, { first: 1 });
-  const found = results.nodes[0];
-  if (!found) {
-    console.warn(`[linear-client] addLabelByIssueKey: ${issueIdentifier} not found`);
+  let issue: Issue;
+  try {
+    issue = await client.issue(issueIdentifier);
+  } catch (err) {
+    console.warn(
+      `[linear-client] addLabelByIssueKey: ${issueIdentifier} not found via direct lookup:`,
+      err instanceof Error ? err.message : err
+    );
     return;
   }
-  // searchIssues returns IssueSearchResult which lacks some Issue methods —
-  // fetch the full Issue by ID so addLabelToIssue can call issue.labels() etc.
-  const issue = await client.issue(found.id);
   const team = await issue.team;
   if (!team) {
     console.warn(`[linear-client] addLabelByIssueKey: ${issueIdentifier} has no team`);
