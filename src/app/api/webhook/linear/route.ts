@@ -86,6 +86,22 @@ export async function POST(request: NextRequest) {
     },
   });
 
+  // Invariant: every row MUST be transitioned out of RECEIVED before this
+  // handler returns. Each routing branch below owns its row update — either
+  // directly here (log/orchestrate/notify) or by delegating to a sub-handler
+  // (triggerAgent, executeGitAction, enqueue) that updates the row in turn.
+  //
+  // History: prior to 2026-05-19, an unexpected throw at certain early
+  // points (rate limit during label-add, missing env var in getAgentConfig,
+  // DB hiccup on first PROCESSING write) would leave the row stuck in
+  // RECEIVED forever. Outer try/catch wrappers only logged to console
+  // without updating the row. Observed on TEA-110, TEA-140, TEA-158.
+  //
+  // Fix: wrap the entire routing block in a try/finally that guarantees the
+  // row is no longer RECEIVED on exit. A best-effort FAILED-mark catches
+  // anything that fell through.
+  try {
+
   // 7. Route status to agent/git action
   const route = routeStatus(toStatus);
 
@@ -313,6 +329,59 @@ export async function POST(request: NextRequest) {
         error
       );
     }
+  }
+
+  } catch (routingError) {
+    // Catch-all: any unexpected throw from routing means we didn't reach
+    // the sub-handler that would have updated the row. Mark FAILED so the
+    // row isn't stuck RECEIVED. Cron-recovery and dashboard alerts can act
+    // on FAILED rows; RECEIVED is invisible to downstream automation.
+    console.error(
+      `[webhook] Routing threw for ${payload.data.identifier} (${toStatus}):`,
+      routingError
+    );
+    const message =
+      routingError instanceof Error ? routingError.message : String(routingError);
+    await prisma.webhookEvent.update({
+      where: { id: event.id },
+      data: {
+        status: WebhookEventStatus.FAILED,
+        errorMessage: `Routing threw: ${message.slice(0, 400)}`,
+        processedAt: new Date(),
+      },
+    }).catch((dbErr) => {
+      console.error(`[webhook] Could not mark event ${event.id} FAILED:`, dbErr);
+    });
+    return NextResponse.json(
+      { received: true, eventId: event.id, error: "routing_failed" },
+      { status: 500 }
+    );
+  }
+
+  // 15. Invariant guard: row must no longer be RECEIVED. If it is, some
+  // sub-handler completed normally but never updated the row (silent
+  // failure path). Mark FAILED with a diagnostic so cron-recovery and
+  // monitoring can act on it.
+  try {
+    const final = await prisma.webhookEvent.findUnique({
+      where: { id: event.id },
+      select: { status: true },
+    });
+    if (final?.status === WebhookEventStatus.RECEIVED) {
+      console.warn(
+        `[webhook] Row ${event.id} (${payload.data.identifier} → ${toStatus}) exited handler as RECEIVED — marking FAILED`
+      );
+      await prisma.webhookEvent.update({
+        where: { id: event.id },
+        data: {
+          status: WebhookEventStatus.FAILED,
+          errorMessage: "Sub-handler returned without updating row status",
+          processedAt: new Date(),
+        },
+      });
+    }
+  } catch (guardErr) {
+    console.error(`[webhook] Invariant guard query failed:`, guardErr);
   }
 
   return NextResponse.json({ received: true, eventId: event.id });
