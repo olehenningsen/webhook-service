@@ -109,6 +109,28 @@ export async function GET(request: NextRequest) {
     },
   });
 
+  // Received-stuck candidates: webhook handler created the row but never
+  // transitioned it out of RECEIVED. PR #16's in-handler invariant catches
+  // in-process throws and final-state guards, but it can't catch Vercel
+  // hard-timeouts (function killed at 60s before the guard runs). Observed
+  // 2026-05-22 on TEA-133: Specification webhook stuck RECEIVED for ~2 min
+  // before manual rescue.
+  //
+  // Scope: RECEIVED rows older than 60s. Skip ancient stale rows (>30 min
+  // is so old that Linear state has likely moved on — re-routing would
+  // cause confusion). Skip rows that are themselves recovery retries to
+  // prevent loops.
+  const receivedStuckCandidates = await prisma.webhookEvent.findMany({
+    where: {
+      status: WebhookEventStatus.RECEIVED,
+      createdAt: {
+        lte: new Date(Date.now() - 60 * 1000),
+        gte: new Date(Date.now() - 30 * 60 * 1000),
+      },
+      linearEventId: { not: { startsWith: "received-retry-" } },
+    },
+  });
+
   const results: Array<{
     eventId: string;
     issueId: string;
@@ -120,7 +142,8 @@ export async function GET(request: NextRequest) {
     processingEvents.length === 0 &&
     failedRecoveryCandidates.length === 0 &&
     autoRetryCandidates.length === 0 &&
-    stalledCandidates.length === 0
+    stalledCandidates.length === 0 &&
+    receivedStuckCandidates.length === 0
   ) {
     return NextResponse.json({ polled: 0, results: [] });
   }
@@ -307,6 +330,125 @@ export async function GET(request: NextRequest) {
       console.warn(
         `[poll-sessions] Stalled-retry check failed for ${event.issueId}:`,
         stalledErr
+      );
+    }
+  }
+
+  // Received-stuck recovery: re-run routing for rows stuck in RECEIVED.
+  // Marks the original SKIPPED with a pointer to the retry row, creates a
+  // fresh row prefixed `received-retry-`, then re-executes the routing
+  // logic (mirrors the webhook handler). Max 1 retry per original via
+  // prefix filter.
+  for (const event of receivedStuckCandidates) {
+    try {
+      // Dedup: if a newer event already exists for this issue+toStatus,
+      // someone already recovered or moved on.
+      const newer = await prisma.webhookEvent.findFirst({
+        where: {
+          issueId: event.issueId,
+          toStatus: event.toStatus,
+          createdAt: { gt: event.createdAt },
+        },
+        select: { id: true },
+      });
+      if (newer) {
+        await prisma.webhookEvent.update({
+          where: { id: event.id },
+          data: {
+            status: WebhookEventStatus.SKIPPED,
+            errorMessage: `Superseded by newer event ${newer.id}`,
+          },
+        });
+        continue;
+      }
+
+      const route = routeStatus(event.toStatus);
+      const retryEvent = await prisma.webhookEvent.create({
+        data: {
+          linearEventId: `received-retry-${event.id}`,
+          issueId: event.issueId,
+          issueTitle: event.issueTitle,
+          fromStatus: event.fromStatus,
+          toStatus: event.toStatus,
+          status: WebhookEventStatus.PROCESSING,
+          triggeredAgent: route.agent ?? null,
+        },
+      });
+
+      // Re-execute the routing (agent + git action) — fire-and-forget. The
+      // sub-handlers update the new row's lifecycle from here.
+      if (route.agent) {
+        triggerAgent({
+          eventId: retryEvent.id,
+          agent: route.agent,
+          issueId: event.issueId,
+          issueTitle: event.issueTitle,
+          fromStatus: event.fromStatus ?? undefined,
+          toStatus: event.toStatus,
+        }).catch((err) => {
+          console.error(
+            `[poll-sessions] received-retry triggerAgent failed for ${event.issueId}:`,
+            err
+          );
+        });
+      } else if (route.action === "orchestrate") {
+        dispatchAvailableWork().catch((err) => {
+          console.error(
+            `[poll-sessions] received-retry orchestrator failed for ${event.issueId}:`,
+            err
+          );
+        });
+      }
+
+      if (route.gitAction) {
+        executeGitAction({
+          eventId: retryEvent.id,
+          action: route.gitAction,
+          issueKey: event.issueId,
+          issueTitle: event.issueTitle,
+          concurrentWithAgent: !!route.agent,
+        }).catch((err) => {
+          console.error(
+            `[poll-sessions] received-retry git action failed for ${event.issueId}:`,
+            err
+          );
+        });
+      }
+
+      // If no agent and no git action (e.g., log/notify), just mark retry
+      // COMPLETED — there's nothing to re-execute.
+      if (!route.agent && !route.gitAction && route.action !== "orchestrate") {
+        await prisma.webhookEvent.update({
+          where: { id: retryEvent.id },
+          data: {
+            status: WebhookEventStatus.COMPLETED,
+            processedAt: new Date(),
+          },
+        });
+      }
+
+      // Mark original SKIPPED with pointer to retry
+      await prisma.webhookEvent.update({
+        where: { id: event.id },
+        data: {
+          status: WebhookEventStatus.SKIPPED,
+          errorMessage: `Stuck RECEIVED — recovered by cron as ${retryEvent.id}`,
+        },
+      });
+
+      console.log(
+        `[poll-sessions] Received-retry for ${event.issueId} (${event.toStatus} → ${route.agent || route.action}) as ${retryEvent.id}`
+      );
+      results.push({
+        eventId: event.id,
+        issueId: event.issueId,
+        sessionStatus: "received-stuck",
+        action: "RECEIVED_RETRY",
+      });
+    } catch (recvErr) {
+      console.warn(
+        `[poll-sessions] Received-retry failed for ${event.issueId}:`,
+        recvErr
       );
     }
   }
@@ -519,7 +661,7 @@ export async function GET(request: NextRequest) {
   }
 
   console.log(
-    `[poll-sessions] Polled ${processingEvents.length} PROCESSING + ${failedRecoveryCandidates.length} FAILED-recovery + ${autoRetryCandidates.length} auto-retry + ${stalledCandidates.length} stalled: ${JSON.stringify(results)}`
+    `[poll-sessions] Polled ${processingEvents.length} PROCESSING + ${failedRecoveryCandidates.length} FAILED-recovery + ${autoRetryCandidates.length} auto-retry + ${stalledCandidates.length} stalled + ${receivedStuckCandidates.length} received: ${JSON.stringify(results)}`
   );
 
   return NextResponse.json({
@@ -527,7 +669,8 @@ export async function GET(request: NextRequest) {
       processingEvents.length +
       failedRecoveryCandidates.length +
       autoRetryCandidates.length +
-      stalledCandidates.length,
+      stalledCandidates.length +
+      receivedStuckCandidates.length,
     results,
   });
 }
